@@ -281,6 +281,26 @@ object BinanceSignedClient {
         }.getOrDefault(emptyList())
     }
 
+    /**
+     * §36 live-mode wallet: real USDT-margined futures wallet balance so the UI shows
+     * the actual Binance balance instead of the paper wallet. Null on any failure.
+     */
+    suspend fun fetchWalletBalance(
+        apiKey: CharArray,
+        secret: CharArray
+    ): Double? = withContext(Dispatchers.IO) {
+        val (code, body) = signedRequest("GET", "/fapi/v2/balance", emptyList(), apiKey, secret)
+        if (code !in 200..299 || body == null) return@withContext null
+        runCatching {
+            val arr = JSONArray(body)
+            (0 until arr.length()).mapNotNull { i ->
+                val entry = arr.optJSONObject(i) ?: return@mapNotNull null
+                if (entry.optString("asset").uppercase() != "USDT") return@mapNotNull null
+                entry.optDouble("balance", Double.NaN)
+            }.firstOrNull()?.takeIf { !it.isNaN() }
+        }.getOrNull()
+    }
+
     // ---------------------------------------------------------------- listen key
 
     suspend fun createListenKey(apiKey: CharArray): String? = withContext(Dispatchers.IO) {

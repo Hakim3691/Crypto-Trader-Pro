@@ -39,7 +39,7 @@ abstract class AppDatabase : RoomDatabase() {
                         "`interval` TEXT NOT NULL, `openTimeUtcMs` INTEGER NOT NULL, `closeTimeUtcMs` INTEGER NOT NULL, " +
                         "`open` REAL NOT NULL, `high` REAL NOT NULL, `low` REAL NOT NULL, `close` REAL NOT NULL, " +
                         "`volume` REAL NOT NULL, `quoteVolume` REAL NOT NULL, `fetchedAtMs` INTEGER NOT NULL, " +
-                        "PRIMARY KEY(`id`)"
+                        "PRIMARY KEY(`id`))"
                 )
             }
         }

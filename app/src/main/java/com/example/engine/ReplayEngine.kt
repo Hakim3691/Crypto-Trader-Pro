@@ -47,6 +47,9 @@ class ReplayEngine(
         /** Ticks between invalidation evaluations (§25 1-5s cadence analog). */
         const val EVAL_EVERY_TICKS = 3
 
+        /** Minimum history candles required to classify a replay as proactive (§37). */
+        const val PROACTIVE_MIN_HISTORY_CANDLES = 50
+
         /** Resting passive slices fill after this many distinct touch ticks (queue). */
         const val TOUCHES_TO_FILL_PASSIVE = 2
 

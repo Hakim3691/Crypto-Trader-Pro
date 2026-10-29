@@ -1,6 +1,5 @@
 package com.example.engine
 
-import com.example.data.model.BacktestMetrics
 import com.example.data.model.MarketRegime
 
 data class SimulationScenario(
@@ -44,37 +43,10 @@ class SimulationHarness {
         )
     )
 
-    fun runScenarioSimulation(scenarioId: String): BacktestMetrics {
-        return when (scenarioId) {
-            "SCENARIO_SHORT_SQUEEZE" -> BacktestMetrics(
-                capturedMoveBeforeConfirmationPct = 82.4,
-                averageInvalidationSpeedSec = 3.6,
-                orderMissRatePct = 5.2,
-                maxAdverseExcursionPct = 0.85,
-                pnlByRegime = mapOf(
-                    "Bullish Continuation" to 5840.0,
-                    "Bearish Continuation" to 2100.0,
-                    "Transition" to 1650.0,
-                    "Balance" to 720.0
-                ),
-                falsePositiveInvalidationPct = 4.2,
-                slowInvalidationPct = 2.0
-            )
-            "SCENARIO_BREAKOUT_TRAP" -> BacktestMetrics(
-                capturedMoveBeforeConfirmationPct = 69.1,
-                averageInvalidationSpeedSec = 2.8, // extremely fast invalidation cutting trap loss
-                orderMissRatePct = 7.4,
-                maxAdverseExcursionPct = 0.62,
-                pnlByRegime = mapOf(
-                    "Bullish Continuation" to 3200.0,
-                    "Bearish Continuation" to 4100.0,
-                    "Transition" to 1980.0,
-                    "Balance" to 1450.0
-                ),
-                falsePositiveInvalidationPct = 5.8,
-                slowInvalidationPct = 1.9
-            )
-            else -> BacktestMetrics()
-        }
-    }
+    /**
+     * §37: the harness defines scenarios structurally only. Metrics are never emitted
+     * from literals — [com.example.ui.MainViewModel.runSimulationScenario] replays the
+     * scenario over persisted candle history via ReplayEngine, and degrades honestly
+     * (neutral metrics + audit note) when history is insufficient.
+     */
 }

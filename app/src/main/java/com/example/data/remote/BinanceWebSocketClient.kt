@@ -87,14 +87,14 @@ object BinanceWebSocketClient {
                         )
                     )
                 }
+            }
 
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    close(IllegalStateException("bookTicker stream failed", t))
-                }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                close(IllegalStateException("bookTicker stream failed", t))
+            }
 
-                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                    close(IllegalStateException("bookTicker stream closed: $code"))
-                }
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                close(IllegalStateException("bookTicker stream closed: $code"))
             }
         }
         val ws = client.newWebSocket(request, listener)
@@ -120,14 +120,14 @@ object BinanceWebSocketClient {
                         )
                     )
                 }
+            }
 
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    close(IllegalStateException("aggTrade stream failed", t))
-                }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                close(IllegalStateException("aggTrade stream failed", t))
+            }
 
-                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                    close(IllegalStateException("aggTrade stream closed: $code"))
-                }
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                close(IllegalStateException("aggTrade stream closed: $code"))
             }
         }
         val ws = client.newWebSocket(request, listener)
@@ -158,14 +158,14 @@ object BinanceWebSocketClient {
                         )
                     )
                 }
+            }
 
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    close(IllegalStateException("kline stream failed", t))
-                }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                close(IllegalStateException("kline stream failed", t))
+            }
 
-                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                    close(IllegalStateException("kline stream closed: $code"))
-                }
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                close(IllegalStateException("kline stream closed: $code"))
             }
         }
         val ws = client.newWebSocket(request, listener)

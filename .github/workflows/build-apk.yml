@@ -1,5 +1,21 @@
 name: Build APK
 
+# Builds debug / release / both APKs for the ProactiveMS Android app.
+#
+# The repository intentionally does not commit a few things this build needs,
+# so the workflow provisions them on the runner:
+#   - gradlew + gradle-wrapper.jar are absent      -> regenerated with the
+#     Gradle distribution installed by gradle/actions/setup-gradle.
+#   - .env (Secrets Gradle Plugin)                 -> copied from .env.example
+#     or created empty.
+#   - debug.keystore / my-upload-key.jks are gitignored -> decoded from
+#     *.base64 when available, otherwise generated with keytool.
+#
+# Signing secrets (KEYSTORE_PATH / STORE_PASSWORD / KEY_PASSWORD) are resolved
+# inside bash instead of a step-level env: block, because unconfigured
+# repository secrets arrive as empty strings and would make Gradle throw
+# "Cannot convert '' to File" when evaluating file(System.getenv(...)).
+
 on:
   workflow_dispatch:
     inputs:
@@ -25,29 +41,51 @@ on:
     paths-ignore:
       - '**.md'
       - 'docs/**'
-      - '**.txt'
 
+# A newer run for the same ref (push or manual dispatch) cancels the older one.
 concurrency:
-  group: build-apk-${{ github.ref }}-${{ github.event.inputs.build_type || 'push' }}
+  group: build-apk-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
-  actions: write
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build:
     name: Assemble Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    env:
-      RAW_TYPE: ${{ github.event.inputs.build_type }}
-      BUILD_TYPE: ${{ env.RAW_TYPE || 'debug' }}
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Resolve build type
+        id: resolve
+        env:
+          # Empty string on push events; ${RAW_TYPE:-debug} below guarantees a
+          # non-empty value for both push and workflow_dispatch.
+          RAW_TYPE: ${{ github.event.inputs.build_type }}
+        run: |
+          set -euo pipefail
+
+          BUILD_TYPE="${RAW_TYPE:-debug}"
+          case "$BUILD_TYPE" in
+            debug|release|both) ;;
+            *)
+              echo "::error::Unsupported build_type '${BUILD_TYPE}' (expected debug, release, or both)."
+              exit 1
+              ;;
+          esac
+
+          # Exported for the later test/build steps and the artifact name.
+          echo "BUILD_TYPE=${BUILD_TYPE}" >> "$GITHUB_ENV"
+          echo "build_type=${BUILD_TYPE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved build type: ${BUILD_TYPE}"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -56,100 +94,109 @@ jobs:
           java-version: '21'
           cache: 'gradle'
 
-      - name: Setup Gradle
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
+          # Keep in sync with gradle/wrapper/gradle-wrapper.properties. This
+          # also puts `gradle` on PATH, which is how the missing gradlew script
+          # gets regenerated in the provisioning step below.
           gradle-version: '9.3.1'
 
       - name: Accept Android SDK licenses
         run: |
           set -euo pipefail
 
-          ANDROID_HOME=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
-          ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
-          export ANDROID_HOME ANDROID_SDK_ROOT
-
-          if [ ! -d "$ANDROID_HOME" ]; then
-            echo "::warning::ANDROID_HOME is not set; skipping Android SDK license acceptance."
+          ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$ANDROID_HOME" ] || [ ! -d "$ANDROID_HOME" ]; then
+            echo "::warning::Android SDK not found on runner; skipping license acceptance."
             exit 0
           fi
+          export ANDROID_HOME
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
 
           LICENSE_DIR="$ANDROID_HOME/licenses"
           mkdir -p "$LICENSE_DIR"
 
-          write_license () {
-            local file="$1"
-            cat > "$file" <<'LICENSE'
-8489d2d54414040913e779484694798b31d05e1e
-e6b7c2ab7fa2298c161305d457b7b25ef50c4a7b
-LICENSE
+          # Official Google SDK license hashes. Append-only so a pre-accepted
+          # licenses/ directory on the runner is never clobbered with an
+          # invalid value.
+          accept_license () {
+            local file="$LICENSE_DIR/$1" hash="$2"
+            touch "$file"
+            grep -qxF "$hash" "$file" || printf '%s\n' "$hash" >> "$file"
           }
 
-          write_license "$LICENSE_DIR/android-sdk-license"
-          write_license "$LICENSE_DIR/android-sdk-preview-license"
-          write_license "$LICENSE_DIR/intel-android-sdk-license"
-          write_license "$LICENSE_DIR/intel-android-prebuilt-license"
+          accept_license android-sdk-license 8933bad161af4178b1185d1a37fbf41ea5269c55
+          accept_license android-sdk-license d56f5187479451eabf01fb78af6dfcb131a6481e
+          accept_license android-sdk-license 24333f8a63b6825ea9c5514f83c2829b004d1fee
+          accept_license android-sdk-preview-license 84831b9409646a918e30573bab4c9c91346d8abd
 
-          for pkg in platforms; do
-            if [ -d "$ANDROID_HOME/$pkg" ]; then
-              pkg_license="$LICENSE_DIR/${pkg}-license"
-              if [ ! -f "$pkg_license" ]; then
-                touch "$pkg_license"
-              fi
-            fi
-          done
-
-          if command -v sdkmanager >/dev/null 2>&1; then
-            yes | sdkmanager --licenses || true
-          else
-            echo "::info::sdkmanager not on PATH; only license files were written."
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           fi
-        shell: bash
 
-      - name: Provision keystores and sanitise signing secrets
+          if [ -n "$SDKMANAGER" ]; then
+            echo "Running: yes | sdkmanager --licenses"
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          else
+            echo "::notice::sdkmanager not found on PATH; license files were written directly."
+          fi
+
+      - name: Provision .env, gradlew and signing keystores
         run: |
           set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
 
+          # ---- .env, required by the Secrets Gradle Plugin -----------------
           if [ ! -f .env ]; then
             if [ -f .env.example ]; then
               cp .env.example .env
             else
-              touch .env
+              : > .env
             fi
+            echo "Created .env (required by the Secrets Gradle Plugin)."
           fi
 
-          if [ ! -f gradlew ]; then
-            if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
-              if ! gradle wrapper --gradle-version 9.3.1 -p .; then
-                echo "::warning::Could not generate gradlew wrapper from properties; falling back to system gradle."
-                wrapper_generated=false
-              else
-                wrapper_generated=true
-              fi
-            else
-              wrapper_generated=false
-            fi
-          else
-            wrapper_generated=true
-          fi
-
-          if [ "$wrapper_generated" != "true" ]; then
+          # ---- Gradle wrapper -----------------------------------------------
+          # This repository does not commit gradlew / gradle-wrapper.jar, so
+          # regenerate them with the Gradle distribution installed above.
+          if [ ! -f gradlew ] || [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
             if ! command -v gradle >/dev/null 2>&1; then
-              echo "::error::No gradlew and no system gradle; cannot proceed."
+              echo "::error::gradlew is missing and no 'gradle' CLI is available to regenerate it."
               exit 1
             fi
-            echo "::info::Using system gradle because no local gradlew is available."
-          else
-            chmod +x gradlew
+            WRAPPER_VERSION="$(sed -n 's/^distributionUrl=.*gradle-\([0-9][0-9.]*\)-.*$/\1/p' gradle/wrapper/gradle-wrapper.properties | head -n 1)"
+            echo "gradlew or gradle-wrapper.jar is missing; regenerating the Gradle wrapper (version: ${WRAPPER_VERSION:-installed})."
+            # --no-configuration-cache keeps this one-off task immune to any
+            # configuration-cache incompatibilities.
+            if [ -n "$WRAPPER_VERSION" ]; then
+              gradle --no-configuration-cache wrapper --gradle-version "$WRAPPER_VERSION"
+            else
+              gradle --no-configuration-cache wrapper
+            fi
+          fi
+          chmod +x gradlew
+          ./gradlew --version
+
+          # ---- Debug keystore (gitignored) -----------------------------------
+          if [ -s debug.keystore.base64 ]; then
+            if ! base64 --decode debug.keystore.base64 > debug.keystore 2>/dev/null; then
+              rm -f debug.keystore
+              echo "::warning::Could not decode debug.keystore.base64; generating a fresh debug keystore."
+            fi
           fi
 
-          if [ -s debug.keystore.base64 ]; then
-            base64 -d debug.keystore.base64 > debug.keystore 2>/dev/null || true
+          # A decoded keystore that keytool cannot open is useless anyway (the
+          # build hardcodes the "android" debug store password), so regenerate.
+          if [ -s debug.keystore ] && ! keytool -list -keystore debug.keystore -storepass android >/dev/null 2>&1; then
+            rm -f debug.keystore
+            echo "::warning::debug.keystore is not a valid keystore; regenerating."
           fi
 
           if [ ! -s debug.keystore ]; then
-            keytool -genkeypair \
-              -v \
+            echo "::group::Generating debug keystore"
+            keytool -genkeypair -v \
               -keystore debug.keystore \
               -alias androiddebugkey \
               -keyalg RSA \
@@ -158,11 +205,14 @@ LICENSE
               -storepass android \
               -keypass android \
               -dname "CN=Android Debug, O=Android, C=US"
+            echo "::endgroup::"
           fi
 
+          # ---- Release keystore (gitignored) ----------------------------------
+          # app/build.gradle.kts expects my-upload-key.jks with alias "upload".
           if [ ! -s my-upload-key.jks ]; then
-            keytool -genkeypair \
-              -v \
+            echo "::group::Generating release upload keystore"
+            keytool -genkeypair -v \
               -keystore my-upload-key.jks \
               -alias upload \
               -keyalg RSA \
@@ -171,8 +221,12 @@ LICENSE
               -storepass android \
               -keypass android \
               -dname "CN=AI Phone, OU=Engineering, O=AI Phone, L=Mountain View, ST=CA, C=US"
+            echo "::endgroup::"
           fi
 
+          # ---- Signing secrets: sanitize before they reach Gradle -------------
+          # Unset repository secrets expand to "" and would make Gradle fail
+          # with "Cannot convert '' to File", so fall back to sane defaults.
           SECRET_KEYSTORE="${{ secrets.KEYSTORE_PATH }}"
           if [ -n "$SECRET_KEYSTORE" ] && [ -f "$SECRET_KEYSTORE" ]; then
             export KEYSTORE_PATH="$SECRET_KEYSTORE"
@@ -186,123 +240,90 @@ LICENSE
           SECRET_KEY_PASS="${{ secrets.KEY_PASSWORD }}"
           export KEY_PASSWORD="${SECRET_KEY_PASS:-android}"
 
-          echo "::group::Resolved build-time environment"
-          echo "BUILD_TYPE=${BUILD_TYPE}"
-          echo "KEYSTORE_PATH=${KEYSTORE_PATH}"
-          echo "STORE_PASSWORD=${STORE_PASSWORD}"
-          echo "KEY_PASSWORD=${KEY_PASSWORD}"
-          echo "HAS_DEBUG_KEYSTORE=$([ -s debug.keystore ] && echo true || echo false)"
-          echo "HAS_RELEASE_KEYSTORE=$([ -s my-upload-key.jks ] && echo true || echo false)"
+          # Hand the resolved values to the later test/build steps. Password
+          # values are never printed to the log.
+          {
+            echo "KEYSTORE_PATH=$KEYSTORE_PATH"
+            echo "STORE_PASSWORD=$STORE_PASSWORD"
+            echo "KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+          echo "::group::Signing configuration"
+          echo "KEYSTORE_PATH=$KEYSTORE_PATH"
+          echo "Debug keystore present:   $([ -s debug.keystore ] && echo yes || echo no)"
+          echo "Release keystore present: $([ -s my-upload-key.jks ] && echo yes || echo no)"
           echo "::endgroup::"
-
-          printf 'export KEYSTORE_PATH=%q\n' "$KEYSTORE_PATH" > build-env.sh
-          printf 'export STORE_PASSWORD=%q\n' "$STORE_PASSWORD" >> build-env.sh
-          printf 'export KEY_PASSWORD=%q\n' "$KEY_PASSWORD" >> build-env.sh
-          printf 'export BUILD_TYPE=%q\n' "$BUILD_TYPE" >> build-env.sh
-        shell: bash
-
-      - name: Run tests
-        if: github.event.inputs.run_tests != false
-        run: |
-          set -euo pipefail
-
-          RAW_TYPE="${{ github.event.inputs.build_type }}"
-          BUILD_TYPE="${RAW_TYPE:-debug}"
-
-          if [ -f build-env.sh ]; then
-            source build-env.sh
-          fi
-
-          if [ -x ./gradlew ]; then
-            GRADLE=(./gradlew)
-          elif command -v gradle >/dev/null 2>&1; then
-            GRADLE=(gradle)
-          else
-            echo "::error::No gradlew and no system gradle; cannot run tests."
-            exit 1
-          fi
-
-          "${GRADLE[@]}" :app:testDebugUnitTest --continue --stacktrace
-        shell: bash
 
       - name: Ensure Gradle memory settings
         run: |
           set -euo pipefail
 
           GRADLE_PROPERTIES=gradle.properties
+          [ -f "$GRADLE_PROPERTIES" ] || touch "$GRADLE_PROPERTIES"
 
-          if [ ! -f "$GRADLE_PROPERTIES" ]; then
-            touch "$GRADLE_PROPERTIES"
-          fi
-
-          ensure_line () {
-            local file="$1"
-            local key="$2"
-            local value="$3"
-            if grep -qE "^${key}=" "$file"; then
-              sed -i -e "s|^${key}=.*|${key}=${value}|" "$file"
+          ensure_property () {
+            local key="$1" value="$2"
+            if grep -qE "^${key}=" "$GRADLE_PROPERTIES"; then
+              sed -i "s|^${key}=.*|${key}=${value}|" "$GRADLE_PROPERTIES"
             else
-              printf '%s\n' "${key}=${value}" >> "$file"
+              printf '%s\n' "${key}=${value}" >> "$GRADLE_PROPERTIES"
             fi
           }
 
-          ensure_line "$GRADLE_PROPERTIES" "org.gradle.jvmargs" "-Xmx4g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC"
-          ensure_line "$GRADLE_PROPERTIES" "org.gradle.parallel" "true"
-          ensure_line "$GRADLE_PROPERTIES" "org.gradle.configuration-cache" "true"
+          # Prevents out-of-memory failures on GitHub's 7 GB runners.
+          ensure_property org.gradle.jvmargs '-Xmx4g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC'
+          ensure_property org.gradle.parallel true
+          ensure_property org.gradle.configuration-cache true
 
-          echo "::group::gradle.properties after adjustment"
+          echo "::group::gradle.properties"
           cat "$GRADLE_PROPERTIES"
           echo "::endgroup::"
-        shell: bash
+
+      - name: Run unit and Robolectric tests
+        # github.event.inputs values are always strings, so compare against the
+        # string 'false'. ('false' != false would always be true and would
+        # never skip the tests.) On push events the input is null and tests run.
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.run_tests != 'false' }}
+        run: |
+          set -euo pipefail
+          ./gradlew :app:testDebugUnitTest --continue
 
       - name: Build APK
         run: |
           set -euo pipefail
 
-          RAW_TYPE="${{ github.event.inputs.build_type }}"
-          BUILD_TYPE="${RAW_TYPE:-debug}"
-
-          if [ -f build-env.sh ]; then
-            source build-env.sh
-          fi
-
-          if [ -x ./gradlew ]; then
-            GRADLE=(./gradlew)
-          elif command -v gradle >/dev/null 2>&1; then
-            GRADLE=(gradle)
-          else
-            echo "::error::No gradlew and no system gradle; cannot build."
-            exit 1
-          fi
-
           case "$BUILD_TYPE" in
-            debug)
-              TASK=":app:assembleDebug"
-              ;;
-            release)
-              TASK=":app:assembleRelease"
-              ;;
-            both)
-              TASK=":app:assembleDebug :app:assembleRelease"
-              ;;
+            debug)   TASKS=":app:assembleDebug" ;;
+            release) TASKS=":app:assembleRelease" ;;
+            both)    TASKS=":app:assembleDebug :app:assembleRelease" ;;
             *)
-              echo "::error::Unknown BUILD_TYPE: $BUILD_TYPE (expected debug, release, or both)"
+              echo "::error::Unsupported BUILD_TYPE '${BUILD_TYPE}'."
               exit 1
               ;;
           esac
 
-          echo "::group::Invoking Gradle"
-          echo "Task: $TASK"
-          echo "JVM args: $(grep -E '^org.gradle.jvmargs=' gradle.properties || true)"
-          echo "::endgroup::"
-          "${GRADLE[@]}" $TASK --stacktrace
-        shell: bash
+          echo "Running: ./gradlew ${TASKS} --stacktrace"
+          # Intentional word splitting: TASKS holds one or two Gradle tasks.
+          # shellcheck disable=SC2086
+          ./gradlew $TASKS --stacktrace
+
+      - name: List generated APKs
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -d app/build/outputs/apk ]; then
+            echo "::group::Generated APKs"
+            find app/build/outputs/apk -type f -name "*.apk" | sort
+            echo "::endgroup::"
+          else
+            echo "::warning::app/build/outputs/apk does not exist; no APKs were produced."
+          fi
 
       - name: Upload APK artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ProactiveMS-${{ github.event.inputs.build_type || env.BUILD_TYPE || 'apk' }}-apk
+          name: ProactiveMS-${{ steps.resolve.outputs.build_type }}-apk
           path: app/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 30

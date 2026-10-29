@@ -7,15 +7,19 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Dangerous
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Security
@@ -60,15 +64,19 @@ fun TopBar(
     riskEnvelope: RiskEnvelope,
     venueHealth: VenueHealth,
     isSessionActive: Boolean,
+    isLiveUniverse: Boolean,
     onToggleKillSwitch: () -> Unit,
     onOpenOrphanWarning: () -> Unit
 ) {
     var modeDropdownExpanded by remember { mutableStateOf(false) }
 
+    // Edge-to-edge: the status bar draws over the app, so the header MUST pad itself
+    // below the system status bar (clock/battery/notifications) — previously missing.
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(CardBackground)
+            .windowInsetsPadding(WindowInsets.statusBars)
             .border(width = 1.dp, color = CardBorder)
             .padding(horizontal = 14.dp, vertical = 10.dp)
     ) {
@@ -105,7 +113,33 @@ fun TopBar(
                 }
             }
 
-            // Mode Selector Pill
+            // Data-source honesty chip (Spec §4): shows whether the displayed universe
+            // is live exchange data or the clearly-labeled offline seed placeholder.
+            Box(
+                modifier = Modifier
+                    .testTag("data_source_chip")
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(
+                        (if (isLiveUniverse) EmeraldBull else AmberWarning).copy(alpha = 0.15f)
+                    )
+                    .border(
+                        1.dp,
+                        (if (isLiveUniverse) EmeraldBull else AmberWarning).copy(alpha = 0.6f),
+                        RoundedCornerShape(10.dp)
+                    )
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = if (isLiveUniverse) "LIVE DATA" else "OFFLINE SEED",
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = if (isLiveUniverse) EmeraldBull else AmberWarning,
+                        fontSize = 9.sp
+                    )
+                )
+            }
+
+            // Mode Selector Pill (tap for Shadow / Paper / Capped Live / Scaled Live)
             Box {
                 Row(
                     modifier = Modifier
@@ -135,6 +169,12 @@ fun TopBar(
                             color = Color(executionMode.badgeColorHex),
                             fontSize = 10.sp
                         )
+                    )
+                    Icon(
+                        imageVector = Icons.Default.ArrowDropDown,
+                        contentDescription = "Switch execution mode",
+                        tint = Color(executionMode.badgeColorHex),
+                        modifier = Modifier.size(16.dp)
                     )
                 }
 

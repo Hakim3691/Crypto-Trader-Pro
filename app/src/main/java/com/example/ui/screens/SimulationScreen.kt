@@ -37,7 +37,7 @@ import androidx.compose.ui.unit.sp
 import com.example.data.model.BacktestMetrics
 import com.example.engine.SimulationScenario
 import com.example.ui.theme.AmberWarning
-import com.example.engine.ReplayResult
+import com.example.engine.ReplayEngine.ReplayResult
 import com.example.ui.theme.CardBackground
 import com.example.ui.theme.CardBorder
 import com.example.ui.theme.CrimsonBear

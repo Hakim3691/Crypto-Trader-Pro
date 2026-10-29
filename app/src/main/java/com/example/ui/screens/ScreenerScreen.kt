@@ -55,6 +55,7 @@ import com.example.ui.theme.VioletAccent
 fun ScreenerScreen(
     assets: List<CryptoAsset>,
     selectedAsset: CryptoAsset?,
+    isLiveUniverse: Boolean,
     onSelectAsset: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -107,6 +108,45 @@ fun ScreenerScreen(
                 text = "Strict Inclusion: 24h Vol $50M - $750M • Spread < 0.10% • Active Funding History",
                 style = MaterialTheme.typography.labelSmall.copy(
                     color = SlateTextMuted,
+                    fontSize = 10.sp
+                )
+            )
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // §4 display-data honesty banner: never show simulated values as if live.
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(
+                    (if (isLiveUniverse) EmeraldBull else AmberWarning).copy(alpha = 0.10f),
+                    RoundedCornerShape(8.dp)
+                )
+                .border(
+                    1.dp,
+                    (if (isLiveUniverse) EmeraldBull else AmberWarning).copy(alpha = 0.5f),
+                    RoundedCornerShape(8.dp)
+                )
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(if (isLiveUniverse) EmeraldBull else AmberWarning)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = if (isLiveUniverse) {
+                    "LIVE — streaming from Binance + CoinGlass public APIs (no keys needed)"
+                } else {
+                    "OFFLINE SEED DATA — live discovery in progress or feeds unreachable; values are placeholders, not market data"
+                },
+                style = MaterialTheme.typography.labelSmall.copy(
+                    color = if (isLiveUniverse) EmeraldBull else AmberWarning,
+                    fontWeight = FontWeight.SemiBold,
                     fontSize = 10.sp
                 )
             )

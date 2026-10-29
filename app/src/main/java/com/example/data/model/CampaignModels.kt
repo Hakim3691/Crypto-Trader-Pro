@@ -99,6 +99,16 @@ data class InvalidationReason(
     val explanation: String
 )
 
+data class LiquidationContext(
+    val longLiquidatedUsd24h: Double,
+    val shortLiquidatedUsd24h: Double,
+    val lastUpdatedMs: Long
+) {
+    companion object {
+        val EMPTY = LiquidationContext(0.0, 0.0, 0L)
+    }
+}
+
 data class EvidenceFrame(
     val timestamp: Long,
     val asset: String,
@@ -109,6 +119,7 @@ data class EvidenceFrame(
     val acceptanceQuality: Double,  // 0.0 to 1.0
     val rejectionQuality: Double,   // 0.0 to 1.0
     val trapProbabilityPct: Int,    // 0 to 100
+    val liquidationContext: LiquidationContext = LiquidationContext.EMPTY,
     val recentImpulseQuality: String
 )
 

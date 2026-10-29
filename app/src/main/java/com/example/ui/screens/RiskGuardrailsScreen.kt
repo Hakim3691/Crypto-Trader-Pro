@@ -3,6 +3,7 @@ package com.example.ui.screens
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -45,9 +46,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.model.ExecutionMode
 import com.example.data.model.RiskEnvelope
 import com.example.data.model.VenueHealth
 import com.example.ui.theme.AmberWarning
@@ -65,9 +68,12 @@ fun RiskGuardrailsScreen(
     riskEnvelope: RiskEnvelope,
     venueHealth: VenueHealth,
     isSessionActive: Boolean,
+    executionMode: ExecutionMode,
+    liveWalletUsd: Double?,
     onToggleKillSwitch: () -> Unit,
     onStartSession: (key: String, secret: String) -> Unit,
     onTerminateSession: () -> Unit,
+    onUpdatePaperWallet: (equityUsd: Double, riskPct: Double, maxGrossUsd: Double, dailyLossLimitR: Double) -> Unit,
     isDiagnosticsRunning: Boolean,
     hasLiveDiagnostics: Boolean,
     onRunDiagnostics: () -> Unit,
@@ -142,7 +148,14 @@ fun RiskGuardrailsScreen(
                     }
                     Column {
                         Text("Daily PnL / Limit", style = MaterialTheme.typography.labelSmall.copy(color = SlateTextMuted, fontSize = 9.sp))
-                        Text("+$${riskEnvelope.dailyPnLUsd.toInt()} (2.0R)", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, color = EmeraldBull))
+                        Text(
+                            text = "${if (riskEnvelope.dailyPnLUsd >= 0.0) "+" else "-"}$${kotlin.math.abs(riskEnvelope.dailyPnLUsd).toInt()} (Stop: -${riskEnvelope.dailyLossLimitR}R)",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace,
+                                color = if (riskEnvelope.dailyPnLUsd >= 0.0) EmeraldBull else CrimsonBear
+                            )
+                        )
                     }
                 }
 
@@ -194,6 +207,141 @@ fun RiskGuardrailsScreen(
                             fontWeight = FontWeight.Bold
                         )
                     }
+                }
+            }
+        }
+
+        // §5 Paper-mode wallet setup: user-configurable wallet + risk parameters.
+        item {
+            var equityText by remember(riskEnvelope.accountEquityUsd) {
+                mutableStateOf(riskEnvelope.accountEquityUsd.toInt().toString())
+            }
+            var riskText by remember(riskEnvelope.riskPerCampaignPct) {
+                mutableStateOf(riskEnvelope.riskPerCampaignPct.toString())
+            }
+            var grossText by remember(riskEnvelope.maxGrossExposureUsd) {
+                mutableStateOf(riskEnvelope.maxGrossExposureUsd.toInt().toString())
+            }
+            var lossLimitText by remember(riskEnvelope.dailyLossLimitR) {
+                mutableStateOf(riskEnvelope.dailyLossLimitR.toString())
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(CardBackground, RoundedCornerShape(10.dp))
+                    .border(1.dp, CardBorder, RoundedCornerShape(10.dp))
+                    .padding(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "WALLET & RISK PARAMETERS",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = SlateTextSecondary,
+                            fontSize = 10.sp
+                        )
+                    )
+                    Text(
+                        text = if (executionMode == ExecutionMode.CAPPED_LIVE || executionMode == ExecutionMode.SCALED_LIVE)
+                            "LIVE WALLET" else "PAPER WALLET",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = if (executionMode == ExecutionMode.CAPPED_LIVE || executionMode == ExecutionMode.SCALED_LIVE)
+                                AmberWarning else EmeraldBull,
+                            fontSize = 9.sp
+                        )
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Text(
+                    text = "Paper modes simulate ONLY the wallet and trade outcomes against live prices — set the wallet here. " +
+                        "Live modes show your real Binance futures balance instead.",
+                    style = MaterialTheme.typography.labelSmall.copy(color = SlateTextMuted, fontSize = 9.sp)
+                )
+
+                if (liveWalletUsd != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Real Binance Futures Wallet (USDT): $${Math.round(liveWalletUsd * 100.0) / 100.0}",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            color = EmeraldBull,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp
+                        )
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = equityText,
+                        onValueChange = { equityText = it },
+                        label = { Text("Equity $") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f).testTag("paper_equity_input")
+                    )
+                    OutlinedTextField(
+                        value = riskText,
+                        onValueChange = { riskText = it },
+                        label = { Text("Risk %/campaign") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        modifier = Modifier.weight(1f).testTag("paper_risk_input")
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = grossText,
+                        onValueChange = { grossText = it },
+                        label = { Text("Max gross $") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f).testTag("paper_gross_input")
+                    )
+                    OutlinedTextField(
+                        value = lossLimitText,
+                        onValueChange = { lossLimitText = it },
+                        label = { Text("Daily stop (R)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        modifier = Modifier.weight(1f).testTag("paper_loss_limit_input")
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Button(
+                    onClick = {
+                        val equity = equityText.toDoubleOrNull()
+                        val riskPct = riskText.toDoubleOrNull()
+                        val maxGross = grossText.toDoubleOrNull()
+                        val lossLimit = lossLimitText.toDoubleOrNull()
+                        if (equity != null && equity > 0.0) {
+                            onUpdatePaperWallet(
+                                equity,
+                                riskPct ?: riskEnvelope.riskPerCampaignPct,
+                                maxGross ?: riskEnvelope.maxGrossExposureUsd,
+                                lossLimit ?: riskEnvelope.dailyLossLimitR
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().testTag("paper_wallet_apply"),
+                    colors = ButtonDefaults.buttonColors(containerColor = CyanAccent, contentColor = Color.Black)
+                ) {
+                    Text("Apply Wallet & Risk", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                 }
             }
         }

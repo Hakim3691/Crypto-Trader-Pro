@@ -41,15 +41,21 @@ class SessionSecurityManager {
      * and deactivates the session immediately.
      */
     fun terminateSessionAndWipeRam() {
+        zeroize()
+        _isSessionActive.value = false
+    }
+
+    /** Zeroizes any currently held credential buffers in place, then clears them. */
+    private fun zeroize() {
         ephemeralApiKeyChars?.fill('\u0000')
         ephemeralApiSecretChars?.fill('\u0000')
         ephemeralApiKeyChars = null
         ephemeralApiSecretChars = null
-        _isSessionActive.value = false
     }
 
     fun hasValidActiveSession(): Boolean {
-        return _isSessionActive.value && !ephemeralApiKeyChars.isNullOrEmpty()
+        val key = ephemeralApiKeyChars
+        return _isSessionActive.value && key != null && key.isNotEmpty()
     }
 
     /**
@@ -60,7 +66,7 @@ class SessionSecurityManager {
     fun copyCredentials(): Pair<CharArray, CharArray>? {
         val key = ephemeralApiKeyChars
         val secret = ephemeralApiSecretChars
-        if (key.isNullOrEmpty() || secret.isNullOrEmpty() || !_isSessionActive.value) return null
+        if (key == null || key.isEmpty() || secret == null || secret.isEmpty() || !_isSessionActive.value) return null
         return Pair(key.copyOf(), secret.copyOf())
     }
 

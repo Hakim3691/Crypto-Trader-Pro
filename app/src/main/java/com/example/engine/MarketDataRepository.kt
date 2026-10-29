@@ -1,12 +1,7 @@
 package com.example.engine
 
 import com.example.data.model.CryptoAsset
-import com.example.data.model.EvidenceFrame
 import com.example.data.model.MarketRegime
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flow
-import kotlin.random.Random
 
 data class OrderBookLevel(val price: Double, val size: Double)
 data class OrderBookSnapshot(
@@ -23,6 +18,13 @@ data class TakerTrade(
     val isBuyerMaker: Boolean // true = taker sell, false = taker buy
 )
 
+/**
+ * Offline seed universe ONLY. Per Spec §4 every display input must come from the live
+ * Binance/CoinGlass public feeds, so this class no longer contains any simulated tick,
+ * order-book or trade generators — [LiveMarketDataProvider] and [UniverseScreener] own
+ * the real data paths. The seed exists solely as an instant first-frame placeholder
+ * (clearly labeled in the UI) and for unit-test determinism.
+ */
 class MarketDataRepository {
 
     // Initial universe of mid-caps strictly filtered by volume $50M - $750M
@@ -144,73 +146,4 @@ class MarketDataRepository {
     )
 
     fun getInitialUniverse(): List<CryptoAsset> = initialUniverse
-
-    /**
-     * Active Delta Mode: high-frequency tick and delta stream for currently selected asset
-     */
-    fun streamLiveTicks(baseAsset: CryptoAsset): Flow<CryptoAsset> = flow {
-        var current = baseAsset
-        while (true) {
-            delay(1200)
-            // Generate micro volatility delta
-            val pctDelta = (Random.nextDouble(-0.18, 0.20)) / 100.0
-            val newPrice = (current.lastPrice * (1.0 + pctDelta)).let { Math.round(it * 1000.0) / 1000.0 }
-            val oiDrift = (Random.nextDouble(-0.35, 0.45)) / 100.0
-            val newOi = current.openInterestUsd * (1.0 + oiDrift)
-            val fundingDelta = (Random.nextDouble(-0.0005, 0.0005))
-            val newFunding = current.fundingRatePct + fundingDelta
-
-            current = current.copy(
-                lastPrice = newPrice,
-                openInterestUsd = newOi,
-                fundingRatePct = newFunding
-            )
-            emit(current)
-        }
-    }
-
-    /**
-     * Real-time L2 order book stream
-     */
-    fun streamOrderBook(asset: String, midPrice: Double, atr: Double): Flow<OrderBookSnapshot> = flow {
-        while (true) {
-            val tickStep = maxOf(0.01, atr * 0.08)
-            val bids = (1..6).map { i ->
-                val p = midPrice - (i * tickStep)
-                val size = Random.nextDouble(15.0, 180.0)
-                OrderBookLevel(Math.round(p * 100.0) / 100.0, Math.round(size * 10.0) / 10.0)
-            }
-            val asks = (1..6).map { i ->
-                val p = midPrice + (i * tickStep)
-                val size = Random.nextDouble(15.0, 180.0)
-                OrderBookLevel(Math.round(p * 100.0) / 100.0, Math.round(size * 10.0) / 10.0)
-            }
-            val spread = ((asks.first().price - bids.first().price) / midPrice) * 100.0
-            emit(OrderBookSnapshot(asset, bids, asks, Math.round(spread * 1000.0) / 1000.0))
-            delay(1500)
-        }
-    }
-
-    /**
-     * Generates simulated taker trades
-     */
-    fun streamTakerTrades(midPrice: Double): Flow<TakerTrade> = flow {
-        var tradeId = 1000L
-        while (true) {
-            delay(800)
-            val isBuyerMaker = Random.nextBoolean()
-            val delta = Random.nextDouble(-0.02, 0.02)
-            val price = midPrice + delta
-            val qty = Random.nextDouble(2.0, 85.0)
-            emit(
-                TakerTrade(
-                    id = ++tradeId,
-                    timestamp = System.currentTimeMillis(),
-                    price = Math.round(price * 100.0) / 100.0,
-                    qty = Math.round(qty * 10.0) / 10.0,
-                    isBuyerMaker = isBuyerMaker
-                )
-            )
-        }
-    }
 }

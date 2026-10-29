@@ -8,7 +8,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -85,6 +88,7 @@ fun ProactiveMsApp(viewModel: MainViewModel = viewModel()) {
                 riskEnvelope = uiState.riskEnvelope,
                 venueHealth = uiState.venueHealth,
                 isSessionActive = uiState.isSessionActive,
+                isLiveUniverse = uiState.isLiveUniverse,
                 onToggleKillSwitch = { viewModel.toggleKillSwitch() },
                 onOpenOrphanWarning = { viewModel.openOrphanedOrderWarning() }
             )
@@ -107,6 +111,7 @@ fun ProactiveMsApp(viewModel: MainViewModel = viewModel()) {
                     ScreenerScreen(
                         assets = uiState.assets,
                         selectedAsset = uiState.selectedAsset,
+                        isLiveUniverse = uiState.isLiveUniverse,
                         onSelectAsset = { symbol ->
                             viewModel.selectAsset(symbol)
                             currentDestination = AppDestination.DASHBOARD
@@ -142,9 +147,14 @@ fun ProactiveMsApp(viewModel: MainViewModel = viewModel()) {
                         riskEnvelope = uiState.riskEnvelope,
                         venueHealth = uiState.venueHealth,
                         isSessionActive = uiState.isSessionActive,
+                        executionMode = uiState.executionMode,
+                        liveWalletUsd = uiState.liveWalletUsd,
                         onToggleKillSwitch = { viewModel.toggleKillSwitch() },
                         onStartSession = { k, s -> viewModel.startApiSession(k, s) },
                         onTerminateSession = { viewModel.terminateApiSession() },
+                        onUpdatePaperWallet = { equity, riskPct, maxGross, dailyLossR ->
+                            viewModel.updatePaperWallet(equity, riskPct, maxGross, dailyLossR)
+                        },
                         isDiagnosticsRunning = uiState.isDiagnosticsRunning,
                         hasLiveDiagnostics = uiState.hasLiveDiagnostics,
                         onRunDiagnostics = { viewModel.runPreFlightDiagnostics() }
@@ -178,6 +188,33 @@ fun ProactiveMsApp(viewModel: MainViewModel = viewModel()) {
             onAcknowledgeAndWipe = { viewModel.acknowledgeOrphanedOrderWarning() },
             onDismiss = { viewModel.dismissOrphanedOrderWarning() }
         )
+
+        // §36: live modes cannot route orders without an unlocked API session —
+        // guide the user to the key-entry flow instead of switching silently.
+        if (uiState.isLiveModeBlocked) {
+            AlertDialog(
+                onDismissRequest = { viewModel.dismissLiveModeGate() },
+                title = { Text("Live mode needs your Binance keys") },
+                text = {
+                    Text(
+                        "Capped/Scaled Live routes real orders to Binance, so an in-memory API " +
+                            "session must be unlocked first (keys are never persisted). " +
+                            "Paper mode keeps simulating the wallet and fills against live prices."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        viewModel.dismissLiveModeGate()
+                        currentDestination = AppDestination.RISK
+                    }) { Text("Open Guardrails") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { viewModel.dismissLiveModeGate() }) {
+                        Text("Stay in Paper")
+                    }
+                }
+            )
+        }
 
         // Section 24: Manual Override Dialog with Persistent Guardrail Warnings
         ManualOverrideDialog(

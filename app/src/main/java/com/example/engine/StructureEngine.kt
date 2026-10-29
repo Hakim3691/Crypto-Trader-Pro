@@ -7,6 +7,7 @@ import com.example.data.model.ZoneType
 import com.example.data.remote.BinanceFuturesClient
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Phase 3 (Spec §8): level detection from real swing structure.

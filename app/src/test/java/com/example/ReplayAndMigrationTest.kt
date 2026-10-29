@@ -2,6 +2,8 @@ package com.example
 
 import com.example.data.local.AppDatabase
 import com.example.data.local.CandleEntity
+import com.example.engine.ExecutionGuardrails.PositionMismatchAction
+import com.example.engine.IndicatorMath.BiasBand
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import android.content.Context
@@ -13,6 +15,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import kotlinx.coroutines.runBlocking
 
 /**
  * Phase 5 verification + Room v1→v2 migration test (Spec §5, §37).
@@ -44,7 +47,7 @@ class ReplayAndMigrationTest {
     // ------------------------------------------------------------ candle store
 
     @Test
-    fun `candle store round-trips rows and replaces on primary key conflict`() {
+    fun `candle store round-trips rows and replaces on primary key conflict`() = runBlocking {
         val dao = db.candleDao()
         val now = 1_700_000_000_000L
         val rows = listOf(
@@ -68,6 +71,7 @@ class ReplayAndMigrationTest {
         dao.clearCandles("SOLUSDT", "1h")
         assertEquals(0, dao.getCandles("SOLUSDT", "1h").size)
         assertEquals(1, dao.getCandles("BTCUSDT", "4h").size)
+        Unit
     }
 
     private fun candle(
@@ -91,7 +95,9 @@ class ReplayAndMigrationTest {
         fetchedAtMs = fetchedAt
     )
 
-    // ------------------------------------------------------------ migration    @Test
+    // ------------------------------------------------------------ migration
+
+    @Test
     fun `migration 1 to 2 preserves user rows and adds candle table`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val dbName = "migration-test-db"
@@ -130,15 +136,15 @@ class ReplayAndMigrationTest {
         try {
             assertEquals(2, migrated.openHelper.readableDatabase.version)
             // §5 heavy-data table created by the migration, on the correct schema.
-            migrated.openHelper.readableDatabase.rawQuery("SELECT count(*) FROM htf_candles").use { c ->
+            migrated.openHelper.readableDatabase.query("SELECT count(*) FROM htf_candles").use { c ->
                 assertTrue(c.moveToFirst())
             }
             // User data survived the upgrade instead of being wiped.
-            migrated.openHelper.readableDatabase.rawQuery("SELECT symbol FROM crypto_assets").use { cursor ->
+            migrated.openHelper.readableDatabase.query("SELECT symbol FROM crypto_assets").use { cursor ->
                 assertTrue(cursor.moveToFirst())
                 assertEquals("SOLUSDT", cursor.getString(0))
             }
-            migrated.openHelper.readableDatabase.rawQuery("SELECT reasonCode FROM audit_trail").use { cursor ->
+            migrated.openHelper.readableDatabase.query("SELECT reasonCode FROM audit_trail").use { cursor ->
                 assertTrue(cursor.moveToFirst())
                 assertEquals("SEED", cursor.getString(0))
             }
@@ -304,10 +310,11 @@ class ReplayAndMigrationTest {
 
     @Test
     fun `swing points detect fractal extremes on a synthetic w-shape`() {
-        // low-high-low-high... sequence with flat runs between pivots.
+        // low-high-low-high... sequence with flat runs between pivots. Wick extremes
+        // equal the close so asserted pivot prices are exact.
         fun candleAt(price: Double, t: Long) = com.example.data.remote.BinanceFuturesClient.Candle(
-            openTimeUtcMs = t, open = price, high = price * 1.0001,
-            low = price * 0.9999, close = price, volume = 1.0,
+            openTimeUtcMs = t, open = price, high = price,
+            low = price, close = price, volume = 1.0,
             closeTimeUtcMs = t + 1, quoteVolume = price
         )
         val prices = listOf(100.0, 95.0, 100.0, 105.0, 100.0, 95.0, 100.0, 105.0, 100.0)
@@ -378,11 +385,11 @@ class ReplayAndMigrationTest {
     @Test
     fun `bias band table maps scores per spec 15`() {
         with(com.example.engine.IndicatorMath.BiasBand) {
-            assertEquals(STRONG_BULL, of(60))
-            assertEquals(BULL, of(30))
-            assertEquals(NEUTRAL, of(0))
-            assertEquals(BEAR, of(-30))
-            assertEquals(STRONG_BEAR, of(-60))
+            assertEquals(BiasBand.STRONG_BULL, of(60))
+            assertEquals(BiasBand.BULL, of(30))
+            assertEquals(BiasBand.NEUTRAL, of(0))
+            assertEquals(BiasBand.BEAR, of(-30))
+            assertEquals(BiasBand.STRONG_BEAR, of(-60))
         }
     }
 

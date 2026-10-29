@@ -1,6 +1,7 @@
 package com.example.ui
 
 import android.app.Application
+import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.BuildConfig
@@ -38,18 +39,21 @@ import com.example.engine.MarketDataRepository
 import com.example.engine.OrphanInterceptDecision
 import com.example.engine.OrphanInterceptPolicy
 import com.example.engine.OrderBookSnapshot
+import com.example.engine.PaperPnl
 import com.example.engine.OverrideWarning
 import com.example.engine.PathEngine
 import com.example.engine.ReplayEngine
-import com.example.engine.ReplayResult
+import com.example.engine.ReplayEngine.ReplayResult
 import com.example.engine.RiskEngine
 import com.example.engine.SessionSecurityManager
 import com.example.engine.SimulationHarness
 import com.example.engine.SimulationScenario
 import com.example.engine.UniverseScreener
+import com.example.engine.UniverseSnapshot
 import com.example.engine.StructureEngine
 import com.example.engine.TakerTrade
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -87,13 +91,20 @@ data class MainUiState(
     /** True once a real diagnostics sample has populated venueHealth (vs. built-in defaults). */
     val hasLiveDiagnostics: Boolean = false,
     /** True when the current universe came from live exchange discovery (vs offline seed). */
-    val isLiveUniverse: Boolean = false
+    val isLiveUniverse: Boolean = false,
+    /** §36: user tapped a live mode while no API session is unlocked — show the gate dialog. */
+    val isLiveModeBlocked: Boolean = false,
+    /** Real Binance futures wallet (USDT) once a live session is unlocked; null in paper. */
+    val liveWalletUsd: Double? = null
  )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val db = AppDatabase.getDatabase(application)
     private val repository = DatabaseRepository(db)
+
+    /** Paper-wallet config persistence (non-sensitive numbers only; Spec §5). */
+    private val paperPrefs = application.getSharedPreferences("paper_wallet_prefs", Context.MODE_PRIVATE)
 
     private val marketDataRepo = MarketDataRepository()
     private val universeScreener = UniverseScreener(db.candleDao())
@@ -125,16 +136,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var activeDeltaJob: Job? = null
     private var orderBookJob: Job? = null
     private var takerFlowJob: Job? = null
+    private var liveWalletJob: Job? = null
+
+    /** §5 Paper wallet: cumulative realized PnL today (USD), booked at flatten events. */
+    private var paperRealizedPnlUsd = 0.0
 
     init {
         // Optional CoinGlass key from the secrets-managed environment (never persisted).
         runCatching {
             CoinGlassClient.apiKey = BuildConfig.COINGLASS_API_KEY
         }
+        applyStoredPaperWallet()
         loadInitialData()
         observeAuditLogs()
         runPreFlightDiagnostics()
         startDormantUniversePolling()
+        startDiagnosticsPolling()
     }
 
     private fun loadInitialData() {
@@ -144,16 +161,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val defaultAsset = initialAssets.first()
 
         viewModelScope.launch {
-            val liveUniverse = runCatching { liveProvider.loadUniverseOnce() }
-                .getOrDefault(initialAssets)
-            val chosen = liveUniverse.firstOrNull() ?: defaultAsset
-            applyUniverseAndRecompute(liveUniverse, chosen)
+            val snapshot = runCatching { liveProvider.loadUniverseOnce() }
+                .getOrDefault(UniverseSnapshot(initialAssets, isLive = false))
+            val chosen = snapshot.assets.firstOrNull() ?: defaultAsset
+            applyUniverseAndRecompute(snapshot.assets, chosen, snapshot.isLive)
         }
 
         val map = structureEngine.buildLevelMap(defaultAsset)
         val candidatePaths = pathEngine.rankCandidatePaths(defaultAsset, map)
         val initialCampaigns = campaignEngine.planCampaigns(defaultAsset, map, candidatePaths)
-        val initialEvidence = featureEngine.buildEvidenceFrame(defaultAsset)
+        // §4: deterministic evidence even for the seed placeholder — no Random values
+        // are ever painted as if they were market data.
+        val initialEvidence = liveProvider.buildEvidenceFrame(defaultAsset)
 
         _uiState.value = _uiState.value.copy(
             assets = initialAssets,
@@ -202,7 +221,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Applies a freshly-screened universe and recomputes analytics for the chosen symbol. */
-    private suspend fun applyUniverseAndRecompute(universe: List<CryptoAsset>, chosen: CryptoAsset) {
+    private suspend fun applyUniverseAndRecompute(
+        universe: List<CryptoAsset>,
+        chosen: CryptoAsset,
+        isLive: Boolean
+    ) {
         // §8: build the level map from real swing structure when candle history exists;
         // fall back to the ATR-offset synthesis only when no candles are available.
         val timeframes = runCatching { universeScreener.loadTimeframes(chosen.symbol) }.getOrNull()
@@ -233,7 +256,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             selectedCampaign = gatedCampaigns.firstOrNull(),
             liveEvidence = evidence,
             calibration = calibration,
-            isLiveUniverse = universe.any { it.quoteVolume24h > 0 && it.orderBookSpreadPct < 100.0 }
+            isLiveUniverse = isLive
         )
         routeLiveBoards(gatedCampaigns)
         startUserDataStreamIfNeeded()
@@ -327,7 +350,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // once loaded; the synchronous paint above keeps first response instant.
         viewModelScope.launch {
             if (_uiState.value.selectedAsset?.symbol == asset.symbol) {
-                applyUniverseAndRecompute(_uiState.value.assets, asset)
+                applyUniverseAndRecompute(_uiState.value.assets, asset, _uiState.value.isLiveUniverse)
             }
         }
 
@@ -346,11 +369,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun startDormantUniversePolling() {
         dormantPollingJob?.cancel()
         dormantPollingJob = viewModelScope.launch {
-            liveProvider.dormantUniversePolling().collect { universe ->
+            liveProvider.dormantUniversePolling().collect { snapshot ->
                 val currentSymbol = _uiState.value.selectedAsset?.symbol
-                val chosen = universe.find { it.symbol == currentSymbol } ?: universe.firstOrNull()
+                val chosen = snapshot.assets.find { it.symbol == currentSymbol } ?: snapshot.assets.firstOrNull()
                 if (chosen != null) {
-                    applyUniverseAndRecompute(universe, chosen)
+                    applyUniverseAndRecompute(snapshot.assets, chosen, snapshot.isLive)
                 }
             }
         }
@@ -362,8 +385,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value = _uiState.value.copy(selectedCampaign = campaign)
     }
 
+    fun dismissLiveModeGate() {
+        _uiState.value = _uiState.value.copy(isLiveModeBlocked = false)
+    }
+
     fun setExecutionMode(mode: ExecutionMode) {
+        val isLiveMode = mode == ExecutionMode.CAPPED_LIVE || mode == ExecutionMode.SCALED_LIVE
+        // §36: live modes require an unlocked in-memory API session. Gate with a
+        // dialog instead of switching silently into a mode that cannot route orders.
+        if (isLiveMode && !sessionManager.hasValidActiveSession()) {
+            _uiState.value = _uiState.value.copy(isLiveModeBlocked = true)
+            viewModelScope.launch {
+                repository.logAction(
+                    asset = _uiState.value.selectedAsset?.symbol ?: "ALL",
+                    campaignId = "MODE_SWITCH",
+                    action = AuditLogAction.CAMPAIGN_STAGED,
+                    reasonCode = "LIVE_MODE_GATE",
+                    message = "${mode.displayName} requires an active API session. Open Guardrails to enter your key."
+                )
+            }
+            return
+        }
         _uiState.value = _uiState.value.copy(executionMode = mode)
+        if (isLiveMode) startLiveWalletPolling()
         viewModelScope.launch {
             repository.logAction(
                 asset = _uiState.value.selectedAsset?.symbol ?: "ALL",
@@ -391,9 +435,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value = _uiState.value.copy(
             riskEnvelope = _uiState.value.riskEnvelope.copy(isKillSwitchEngaged = updated),
             campaigns = if (updated) {
-                // Flatten and suppress all active campaigns
-                _uiState.value.campaigns.map {
-                    it.copy(status = CampaignState.CANCELLED)
+                // Flatten and suppress all active campaigns. §5 Paper mode: the kill
+                // switch also closes open paper positions at the last traded price.
+                val flattenPrice = _uiState.value.selectedAsset?.lastPrice ?: 0.0
+                _uiState.value.campaigns.map { c ->
+                    var flattened = c.copy(status = CampaignState.CANCELLED)
+                    if (_uiState.value.executionMode == ExecutionMode.PAPER &&
+                        c.entryLadder.any { slice -> slice.isFilled }
+                    ) {
+                        paperRealizedPnlUsd += PaperPnl.realizedPnlAtFlatten(c, flattenPrice)
+                        flattened = flattened.copy(
+                            entryLadder = c.entryLadder.map { slice ->
+                                slice.copy(isFilled = false, isResting = false)
+                            }
+                        )
+                    }
+                    flattened
                 }
             } else _uiState.value.campaigns
         )
@@ -460,6 +517,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val index = currentCampaigns.indexOfFirst { it.id == campaignId }
         if (index != -1) {
             val c = currentCampaigns[index]
+            // §5 Paper mode: an operator flatten closes the paper position — book
+            // realized PnL at the hard stop before the fills are cleared below.
+            if (_uiState.value.executionMode == ExecutionMode.PAPER &&
+                c.entryLadder.any { it.isFilled }
+            ) {
+                val realized = PaperPnl.realizedPnlAtFlatten(c, c.stopLogic.hardStopPrice)
+                paperRealizedPnlUsd += realized
+                viewModelScope.launch {
+                    repository.logAction(
+                        asset = c.asset,
+                        campaignId = c.id,
+                        action = AuditLogAction.HARD_FLATTEN,
+                        reasonCode = "PAPER_FLATTEN",
+                        message = "${c.family.displayName}: operator flatten booked realized PnL $${"%.2f".format(realized)}"
+                    )
+                }
+            }
             val updated = c.copy(
                 status = CampaignState.CANCELLED,
                 entryLadder = c.entryLadder.map { it.copy(isResting = false, isFilled = false) },
@@ -594,6 +668,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startApiSession(key: String, secret: String) {
         sessionManager.startSession(key, secret)
+        // Real Binance wallet becomes visible as soon as a session is unlocked.
+        startLiveWalletPolling()
         viewModelScope.launch {
             repository.logAction(
                 asset = "PORTFOLIO",
@@ -606,7 +682,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun terminateApiSession() {
+        liveWalletJob?.cancel()
+        liveWalletJob = null
         sessionManager.terminateSessionAndWipeRam()
+        _uiState.value = _uiState.value.copy(liveWalletUsd = null)
         viewModelScope.launch {
             repository.logAction(
                 asset = "PORTFOLIO",
@@ -618,21 +697,74 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * §37: scenario runs are derived from real candle history through the deterministic
+     * ReplayEngine — never from invented literals. When persisted history is
+     * insufficient the run degrades to the scenario's documented posture and says so;
+     * it never fabricates a live reading.
+     */
     fun runSimulationScenario(scenario: SimulationScenario) {
-        val metrics = simulationHarness.runScenarioSimulation(scenario.id)
-        _uiState.value = _uiState.value.copy(
-            selectedScenario = scenario,
-            backtestMetrics = metrics
-        )
-
+        if (_uiState.value.isReplayRunning) return
+        _uiState.value = _uiState.value.copy(selectedScenario = scenario, isReplayRunning = true)
         viewModelScope.launch {
-            repository.logAction(
-                asset = _uiState.value.selectedAsset?.symbol ?: "SIMULATION",
-                campaignId = scenario.id,
-                action = AuditLogAction.CAMPAIGN_STAGED,
-                reasonCode = "SCENARIO_EXECUTED",
-                message = "Backtest scenario executed: ${scenario.name}. Captured move: ${metrics.capturedMoveBeforeConfirmationPct}%"
-            )
+            try {
+                val asset = _uiState.value.selectedAsset
+                val candles = asset?.let {
+                    runCatching { universeScreener.loadTimeframes(it.symbol).candles1h }.getOrDefault(emptyList())
+                }.orEmpty()
+                val hadHistory = asset != null && candles.size >= MIN_SCENARIO_CANDLES
+                val metrics = if (hadHistory && asset != null) {
+                    val calibration = runCatching { universeScreener.loadCalibration(asset) }.getOrNull()
+                    replayEngine.replay(
+                        asset = asset,
+                        candles = candles,
+                        fundingRatePct = asset.fundingRatePct,
+                        spreadPct = asset.orderBookSpreadPct,
+                        calibration = calibration
+                    ).metrics
+                } else {
+                    // §37 honest degradation: no persisted history → no invented numbers.
+                    // The audit trail records exactly why the metrics stay neutral.
+                    BacktestMetrics()
+                }
+                _uiState.value = _uiState.value.copy(backtestMetrics = metrics, isReplayRunning = false)
+                repository.logAction(
+                    asset = _uiState.value.selectedAsset?.symbol ?: "SIMULATION",
+                    campaignId = scenario.id,
+                    action = AuditLogAction.CAMPAIGN_STAGED,
+                    reasonCode = if (hadHistory) "SCENARIO_EXECUTED" else "SCENARIO_DEGRADED",
+                    message = if (hadHistory) {
+                            "Scenario replayed over ${candles.size} persisted 1h candles: ${scenario.name}. " +
+                                "Captured move: ${metrics.capturedMoveBeforeConfirmationPct}%"
+                        } else {
+                            "Scenario ${scenario.name} had insufficient candle history " +
+                                "(${candles.size} < $MIN_SCENARIO_CANDLES); metrics stayed neutral " +
+                                "instead of inventing numbers (§37)"
+                        }
+                )
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(isReplayRunning = false)
+                logLiveNote(
+                    scenario.id,
+                    "SCENARIO_FAILED",
+                    "Scenario replay failed: ${e.message ?: e.javaClass.simpleName}"
+                )
+            }
+        }
+    }
+
+    /**
+     * §2/§33: hardware + mandatory-feed latency are re-sampled on a fixed cadence so
+     * stale-feed, latency, RAM, thermal and low-power guardrails always act on live
+     * health instead of a startup-only snapshot. feedStaleness is derived from the
+     * latest probes inside SessionSecurityManager.
+     */
+    private fun startDiagnosticsPolling() {
+        viewModelScope.launch {
+            while (true) {
+                delay(DIAGNOSTICS_RE_SAMPLE_MS)
+                runPreFlightDiagnostics()
+            }
         }
     }
 
@@ -684,6 +816,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             )
                         }
                         filled
+                    }
+
+                    // §5 Paper wallet accounting: a board that just went CANCELLED while
+                    // still holding fills was hard-flattened by the invalidation engine —
+                    // book realized PnL at the hard stop and release its exposure. The
+                    // realized R total feeds the daily-loss stop (currentRealizedLossR).
+                    working = working.map { c ->
+                        val before = previousCampaigns.find { it.id == c.id }
+                        val hadFills = before?.entryLadder?.any { it.isFilled } == true
+                        if (hadFills && c.status == CampaignState.CANCELLED &&
+                            c.entryLadder.any { it.isFilled }
+                        ) {
+                            val realized = PaperPnl.realizedPnlAtFlatten(c, c.stopLogic.hardStopPrice)
+                            paperRealizedPnlUsd += realized
+                            repository.logAction(
+                                asset = c.asset,
+                                campaignId = c.id,
+                                action = AuditLogAction.HARD_FLATTEN,
+                                reasonCode = "PAPER_FLATTEN",
+                                message = "${c.family.displayName}: paper position flattened at stop ${c.stopLogic.hardStopPrice}; realized PnL $${"%.2f".format(realized)}"
+                            )
+                            c.copy(entryLadder = c.entryLadder.map { it.copy(isFilled = false, isResting = false) })
+                        } else c
                     }
                 }
 
@@ -748,12 +903,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.value.riskEnvelope.accountEquityUsd
                 )
 
+                // §5 Paper wallet: exposure + PnL derived from the actual ladder fills
+                // (never invented). Realized losses convert to R against the configured
+                // per-campaign risk budget so the daily-loss stop (isDailyLossExceeded)
+                // becomes a live gate in paper mode.
+                val envelope = _uiState.value.riskEnvelope
+                val updatedEnvelope = if (_uiState.value.executionMode == ExecutionMode.PAPER) {
+                    val realizedR = PaperPnl.pnlToR(
+                        paperRealizedPnlUsd,
+                        envelope.accountEquityUsd,
+                        envelope.riskPerCampaignPct
+                    )
+                    envelope.copy(
+                        currentGrossExposureUsd = PaperPnl.openExposureUsd(working),
+                        dailyPnLUsd = paperRealizedPnlUsd +
+                            PaperPnl.unrealizedPnlUsd(working, updatedAsset.lastPrice),
+                        currentRealizedLossR = Math.round(minOf(0.0, realizedR) * 100.0) / 100.0,
+                        worstCaseStopOutR = worstCaseR
+                    )
+                } else {
+                    envelope.copy(worstCaseStopOutR = worstCaseR)
+                }
+
                 _uiState.value = _uiState.value.copy(
                     selectedAsset = updatedAsset,
                     liveEvidence = evidence,
                     campaigns = working,
                     selectedCampaign = working.find { it.id == _uiState.value.selectedCampaign?.id } ?: working.firstOrNull(),
-                    riskEnvelope = _uiState.value.riskEnvelope.copy(worstCaseStopOutR = worstCaseR)
+                    riskEnvelope = updatedEnvelope
                 )
 
                 // §22/§33: push cancellations to the venue and reconcile the live position.
@@ -1113,6 +1290,88 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ------------------------------------------------------- paper wallet & live wallet
+
+    /** Loads the persisted paper-wallet config; resets the fake demo PnL/exposure to zero. */
+    private fun applyStoredPaperWallet() {
+        _uiState.value = _uiState.value.copy(
+            riskEnvelope = RiskEnvelope(
+                accountEquityUsd = paperPrefs.getFloat(KEY_PAPER_EQUITY, 50_000f).toDouble(),
+                riskPerCampaignPct = paperPrefs.getFloat(KEY_PAPER_RISK_PCT, 0.5f).toDouble(),
+                maxGrossExposureUsd = paperPrefs.getFloat(KEY_PAPER_MAX_GROSS, 100_000f).toDouble(),
+                dailyLossLimitR = paperPrefs.getFloat(KEY_PAPER_DAILY_LOSS_R, 2.0f).toDouble(),
+                // No invented demo exposure/PnL — the paper wallet starts clean.
+                currentGrossExposureUsd = 0.0,
+                dailyPnLUsd = 0.0,
+                currentRealizedLossR = 0.0,
+                worstCaseStopOutR = 0.0
+            )
+        )
+    }
+
+    /**
+     * §5 paper mode: the user-configured wallet drives sizing and worst-case stop-out
+     * math while trade outcomes stay simulated. Values persist across app restarts.
+     */
+    fun updatePaperWallet(
+        equityUsd: Double,
+        riskPerCampaignPct: Double,
+        maxGrossExposureUsd: Double,
+        dailyLossLimitR: Double
+    ) {
+        if (equityUsd <= 0.0) return
+        val risk = riskPerCampaignPct.coerceIn(0.05, 1.0)
+        val lossLimit = dailyLossLimitR.coerceIn(0.5, 5.0)
+        paperPrefs.edit()
+            .putFloat(KEY_PAPER_EQUITY, equityUsd.toFloat())
+            .putFloat(KEY_PAPER_RISK_PCT, risk.toFloat())
+            .putFloat(KEY_PAPER_MAX_GROSS, maxGrossExposureUsd.coerceAtLeast(0.0).toFloat())
+            .putFloat(KEY_PAPER_DAILY_LOSS_R, lossLimit.toFloat())
+            .apply()
+        _uiState.value = _uiState.value.copy(
+            riskEnvelope = _uiState.value.riskEnvelope.copy(
+                accountEquityUsd = equityUsd,
+                riskPerCampaignPct = risk,
+                maxGrossExposureUsd = maxGrossExposureUsd.coerceAtLeast(0.0),
+                dailyLossLimitR = lossLimit
+            )
+        )
+        viewModelScope.launch {
+            repository.logAction(
+                asset = "PORTFOLIO",
+                campaignId = "PAPER_WALLET",
+                action = AuditLogAction.CAMPAIGN_STAGED,
+                reasonCode = "PAPER_WALLET_UPDATED",
+                message = "Paper wallet set: equity $${equityUsd.toInt()}, risk $risk%/campaign, maxGross $${maxGrossExposureUsd.toInt()}, daily stop ${lossLimit}R"
+            )
+        }
+    }
+
+    /** §36 live mode: poll the real Binance futures wallet while the session is unlocked. */
+    private fun startLiveWalletPolling() {
+        if (!sessionManager.hasValidActiveSession()) return
+        liveWalletJob?.cancel()
+        liveWalletJob = viewModelScope.launch {
+            while (true) {
+                refreshLiveWallet()
+                delay(60_000)
+            }
+        }
+    }
+
+    private suspend fun refreshLiveWallet() {
+        val creds = sessionManager.copyCredentials() ?: return
+        try {
+            val balance = BinanceSignedClient.fetchWalletBalance(creds.first, creds.second)
+            if (balance != null) {
+                _uiState.value = _uiState.value.copy(liveWalletUsd = balance)
+            }
+        } finally {
+            Arrays.fill(creds.first, '\u0000')
+            Arrays.fill(creds.second, '\u0000')
+        }
+    }
+
     private suspend fun logLiveNote(campaignId: String, reasonCode: String, message: String) {
         repository.logAction(
             asset = _uiState.value.selectedAsset?.symbol ?: "PORTFOLIO",
@@ -1130,6 +1389,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         takerFlowJob?.cancel()
         dormantPollingJob?.cancel()
         userDataJob?.cancel()
+        liveWalletJob?.cancel()
         sessionManager.terminateSessionAndWipeRam()
+    }
+
+    private companion object {
+        const val KEY_PAPER_EQUITY = "paper_equity_usd"
+        const val KEY_PAPER_RISK_PCT = "paper_risk_pct"
+        const val KEY_PAPER_MAX_GROSS = "paper_max_gross_usd"
+        const val KEY_PAPER_DAILY_LOSS_R = "paper_daily_loss_r"
+        /** Minimum persisted 1h candles a scenario replay needs to count as history-driven. */
+        const val MIN_SCENARIO_CANDLES = 30
+        /** §2/§33 diagnostics cadence: re-sample hardware + feed latency every minute. */
+        const val DIAGNOSTICS_RE_SAMPLE_MS = 60_000L
     }
 }

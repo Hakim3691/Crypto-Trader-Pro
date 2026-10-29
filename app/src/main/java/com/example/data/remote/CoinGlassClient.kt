@@ -45,7 +45,7 @@ object CoinGlassClient {
     suspend fun fetchFundingRates(): Map<String, Pair<Double, Double?>> = withContext(Dispatchers.IO) {
         val direct = getJson("$BASE/api/fundingRate/current")?.let { body ->
             parseRateList(body, rateKeyCandidates = listOf("rate", "currentFundingRate", "fundingRate"))
-        }
+        } ?: emptyMap()
         if (direct.isNotEmpty()) return@withContext direct
         // v2 fallback: /api/fundingRate/v2/current
         getJson("$BASE/api/fundingRate/v2/current")?.let { body ->
@@ -67,6 +67,16 @@ object CoinGlassClient {
     suspend fun fetchBasis(): Map<String, Double> = withContext(Dispatchers.IO) {
         val body = getJson("$BASE/api/futures/basis?symbol=&interval=h1") ?: return@withContext emptyMap()
         parseBasis(body)
+    }
+
+    /**
+     * Aggregated 24h liquidation history per coin (USD), best-effort.
+     * Uses the CoinGlass futures aggregated-liq-history path for per-coin context.
+     * Empty map on absence — liquidation context is advisory for evidence/pain copy.
+     */
+    suspend fun fetchLiquidationHistory24h(): Map<String, Pair<Double, Double>> = withContext(Dispatchers.IO) {
+        val body = getJson("$BASE/api/futures/liquidation/aggregated-history") ?: return@withContext emptyMap()
+        parseLiquidationHistory24h(body)
     }
 
     // ---------------------------------------------------------------- tolerant parsers
@@ -111,6 +121,33 @@ object CoinGlassClient {
             val basis = listOf("annualizedBasis", "basis", "annualizedBasisRate")
                 .firstNotNullOfOrNull { row.optDoubleOrNull(it) }
             if (basis != null) out[symbol] = basis
+        }
+        out
+    }.getOrDefault(emptyMap())
+
+    private fun parseLiquidationHistory24h(body: String): Map<String, Pair<Double, Double>> = runCatching {
+        val rows = unwrapRows(body)
+        val bySymbol = mutableMapOf<String, MutableList<Pair<Long, Double>>>()
+        (0 until rows.length()).forEach { i ->
+            val row = rows.optJSONObject(i) ?: return@forEach
+            val symbol = row.optStringOrNull("symbol")?.uppercase() ?: return@forEach
+            val longLiq = row.optDoubleOrNull("aggregatedLongLiquidationUsd")
+                ?: row.optDoubleOrNull("longAmount")
+            val shortLiq = row.optDoubleOrNull("aggregatedShortLiquidationUsd")
+                ?: row.optDoubleOrNull("shortAmount")
+            val ts = (row.optDoubleOrNull("time") ?: row.optLongOrNull("time") ?: 0.0).toLong()
+            if (longLiq != null || shortLiq != null) {
+                bySymbol.getOrPut(symbol) { mutableListOf() }.add(ts to (longLiq ?: 0.0))
+                bySymbol.getOrPut(symbol) { mutableListOf() }.add(ts to (shortLiq ?: 0.0))
+            }
+        }
+        val out = mutableMapOf<String, Pair<Double, Double>>()
+        bySymbol.forEach { (sym, samples) ->
+            val longSum = samples.filter { it.second > 0 }.sumOf { it.second }
+            val shortSum = samples.filter { it.second < 0 }.sumOf { it.second }
+            if (longSum != 0.0 || shortSum != 0.0) {
+                out[sym] = longSum to -shortSum
+            }
         }
         out
     }.getOrDefault(emptyMap())
@@ -170,6 +207,17 @@ object CoinGlassClient {
             null, JSONObject.NULL -> null
             is Number -> v.toDouble()
             is String -> v.toDoubleOrNull()
+            else -> null
+        }
+    }
+
+    private fun JSONObject.optLongOrNull(key: String): Long? {
+        if (!has(key)) return null
+        val v = opt(key)
+        return when (v) {
+            null, JSONObject.NULL -> null
+            is Number -> v.toLong()
+            is String -> v.toLongOrNull()
             else -> null
         }
     }

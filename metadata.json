@@ -2,5 +2,5 @@
   "name": "ProactiveMS",
   "description": "Cancellation-first, pre-staged crypto market-structure trade automation engine with symmetric campaign libraries, asymmetric overlays, real-time invalidation, and hardware guardrails.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }

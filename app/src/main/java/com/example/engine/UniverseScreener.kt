@@ -9,23 +9,34 @@ import com.example.data.remote.BinanceFuturesClient
 import com.example.data.remote.CoinGlassClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 /**
  * Phase 2 (Spec §4, §5, §6): live universe discovery and screening.
  *
- * Replaces the hardcoded 6-asset list. Pipeline:
+ * Pipeline:
  *  1. Binance futures exchangeInfo → tradable perp universe.
  *  2. §4 Strict Inclusion: keep symbols whose base asset has a TRADING **spot** market
- *     on Binance AND a CoinGlass derivatives record (funding or OI present).
+ *     on Binance AND a CoinGlass derivatives record (funding or OI present). If the
+ *     CoinGlass service as a whole is unreachable, the screener DEGRADES to
+ *     Binance-validated symbols (funding from the Binance premium index) instead of
+ *     returning nothing — the alternative was the app silently faking an offline seed,
+ *     which violates the live-display mandate. Strict CoinGlass validation resumes the
+ *     moment CoinGlass answers again.
  *  3. §6 Universe Filtering: 24h quote volume $50M–$750M, spread < 0.10% (measured
- *     from the L2 top of book), funding history available.
+ *     from the real L2 top of book), funding history available.
  *  4. Pain Score ranking via [IndicatorMath] on real funding + computed bias.
  *
- * Every fetch degrades gracefully: an absent feed shrinks the universe (or yields an
- * empty one) instead of throwing — and when the live universe is unavailable, callers
- * fall back to the offline seed universe so the app remains usable.
+ * §6 Screener Output: the ranked list is NOT truncated — every qualifying symbol is
+ * returned (the previous hardcoded 12-cap was an invention not present in the spec).
+ *
+ * Performance: volume/spot filtering (cheap REST snapshots) happens BEFORE any
+ * per-symbol calls; depth and kline fetches run with bounded parallelism over only the
+ * survivors, and klines are Room-cached so subsequent polls are nearly free.
  */
 class UniverseScreener(private val candleDao: CandleDao) {
 
@@ -39,12 +50,28 @@ class UniverseScreener(private val candleDao: CandleDao) {
         // §5 Heavy Data staleness window for HTF context.
         const val HTF_STALENESS_MS: Long = 4L * 60L * 60L * 1000L
 
-        const val SCREENED_LIMIT = 12
+        // Bounded concurrency for per-symbol REST work (stays far inside Binance
+        // weight limits while finishing a full pass in seconds, not minutes).
+        const val PARALLEL_SYMBOL_WORK = 8
     }
 
+    /** §4 Pre-processing validation state for one symbol (cheap checks only). */
+    private data class ScreenCandidate(
+        val symbol: String,
+        val baseAsset: String,
+        val ticker: BinanceFuturesClient.Ticker24h,
+        val premium: BinanceFuturesClient.PremiumIndex?,
+        val passesCoinGlassInclusion: Boolean
+    )
+
+    /** Offline seed universe for the clearly-labeled first-frame placeholder. */
+    private val seedRepository = MarketDataRepository()
+
+    fun offlineSeedUniverse(): List<CryptoAsset> = seedRepository.getInitialUniverse()
+
     /**
-     * Discovers and ranks the live mid-cap universe. Returns an empty list when the
-     * mandatory feeds are unreachable (caller decides on fallback).
+     * Discovers and ranks the live mid-cap universe. Returns an empty list when even
+     * the Binance feeds are unreachable (caller decides on the offline state).
      */
     suspend fun screenUniverse(): List<CryptoAsset> = withContext(Dispatchers.IO) {
         coroutineScope {
@@ -52,14 +79,20 @@ class UniverseScreener(private val candleDao: CandleDao) {
             val spotBases = async { BinanceFuturesClient.fetchSpotExchangeInfo() }
             val tickers = async { BinanceFuturesClient.fetch24hTickers() }
             val premiums = async { BinanceFuturesClient.fetchPremiumIndexes() }
-            val funding = async { CoinGlassClient.fetchFundingRates() }
-            val ois = async { CoinGlassClient.fetchOpenInterestUsd() }
-            val basis = async { CoinGlassClient.fetchBasis() }
+            val fundingDeferred = async { CoinGlassClient.fetchFundingRates() }
+            val oisDeferred = async { CoinGlassClient.fetchOpenInterestUsd() }
+            val basisDeferred = async { CoinGlassClient.fetchBasis() }
+            val liqDeferred = async { CoinGlassClient.fetchLiquidationHistory24h() }
 
             val info = exchangeInfo.await() ?: return@coroutineScope emptyList()
             val spotBaseSet = spotBases.await().toSet()
             val tickerBySymbol = tickers.await().associateBy { it.symbol }
             val premiumBySymbol = premiums.await().associateBy { it.symbol }
+            val funding = fundingDeferred.await()
+            val ois = oisDeferred.await()
+            val basis = basisDeferred.await()
+            val liq = liqDeferred.await()
+            val coinGlassReachable = funding.isNotEmpty() || ois.isNotEmpty()
 
             val tradablePerps = info.symbols.filter {
                 it.status == "TRADING" &&
@@ -67,68 +100,111 @@ class UniverseScreener(private val candleDao: CandleDao) {
                     it.quoteAsset == "USDT"
             }
 
-            val candidates = tradablePerps.mapNotNull { sym ->
+            // ---- Stage 1 (cheap, no per-symbol REST): inclusion + §6 volume filter.
+            val stage1 = tradablePerps.mapNotNull { sym ->
                 val ticker = tickerBySymbol[sym.symbol] ?: return@mapNotNull null
                 val premium = premiumBySymbol[sym.symbol]
 
-                // §4 Strict Inclusion Rule: futures+spot on Binance AND futures on CoinGlass.
                 val base = sym.baseAsset?.uppercase() ?: return@mapNotNull null
                 val hasSpot = base in spotBaseSet
-                val cg = funding[sym.symbol]
-                val hasCoinGlassFutures = cg != null || ois.containsKey(sym.symbol)
-                if (!hasSpot || !hasCoinGlassFutures) return@mapNotNull null
+                if (!hasSpot) return@mapNotNull null
+
+                // §4 Strict Inclusion: CoinGlass futures record required when CoinGlass
+                // answered; degraded to Binance-only validation when the service is down.
+                val hasCoinGlassFutures =
+                    funding.containsKey(sym.symbol) || ois.containsKey(sym.symbol)
+                if (coinGlassReachable && !hasCoinGlassFutures) return@mapNotNull null
 
                 val quoteVolume = ticker.quoteVolume ?: return@mapNotNull null
-                val lastPrice = ticker.lastPrice ?: premium?.markPrice ?: return@mapNotNull null
-                val fundingRate = cg?.first ?: premium?.lastFundingRate ?: 0.0
-
-                // §6 filters
                 if (quoteVolume !in MIN_QUOTE_VOLUME_USD..MAX_QUOTE_VOLUME_USD) return@mapNotNull null
+                if (ticker.lastPrice == null && premium?.markPrice == null) return@mapNotNull null
 
-                val spreadPct = measureSpreadPct(sym.symbol, lastPrice)
-
-                val atr5m = atrFor(sym.symbol, "5m", lastPrice)
-                val atr1h = atrFor(sym.symbol, "1h", lastPrice)
-                val atr4h = atrFor(sym.symbol, "4h", lastPrice)
-
-                // §9/§15: structural + momentum multi-horizon bias from real candles.
-                val strategicBias = IndicatorMath.structuralBias(loadCandles(sym.symbol, "4h", 60))
-                val tacticalBias = IndicatorMath.structuralBias(loadCandles(sym.symbol, "1h", 60))
-
-                val regime = classifyRegime(strategicBias, tacticalBias)
-                val pain = IndicatorMath.painScore(fundingRate, tacticalBias)
-                val painPath = buildPainPath(pain, tacticalBias, strategicBias)
-
-                CryptoAsset(
+                ScreenCandidate(
                     symbol = sym.symbol,
                     baseAsset = sym.baseAsset ?: base,
-                    lastPrice = lastPrice,
-                    priceChange24h = ticker.priceChangePercent ?: 0.0,
-                    quoteVolume24h = quoteVolume,
-                    orderBookSpreadPct = spreadPct,
-                    fundingRatePct = fundingRate,
-                    predictedFundingPct = funding[sym.symbol]?.second ?: fundingRate,
-                    openInterestUsd = ois[sym.symbol] ?: 0.0,
-                    basisPremiumPct = basis[sym.symbol] ?: 0.0,
-                    atr5m = atr5m,
-                    atr1h = atr1h,
-                    atr4h = atr4h,
-                    regime = regime,
-                    tacticalBias = tacticalBias,
-                    strategicBias = strategicBias,
-                    primaryPainPath = painPath
+                    ticker = ticker,
+                    premium = premium,
+                    passesCoinGlassInclusion = hasCoinGlassFutures || !coinGlassReachable
                 )
             }
 
-            val qualified = candidates
-                .filter { it.orderBookSpreadPct < MAX_SPREAD_PCT }
-                .sortedByDescending { asset ->
-                    // §6 Screener Output: directional priority ranking.
-                    IndicatorMath.painScore(asset.fundingRatePct, asset.tacticalBias) +
-                        Math.abs(asset.tacticalBias)
+            // ---- Stage 2: real L2 top-of-book spread, bounded-parallel.
+            val semSpread = Semaphore(PARALLEL_SYMBOL_WORK)
+            val spreads: Map<String, Double> = stage1.map { candidate ->
+                async {
+                    semSpread.withPermit {
+                        val mid = candidate.ticker.lastPrice ?: candidate.premium?.markPrice ?: 0.0
+                        candidate.symbol to measureSpreadPct(candidate.symbol, mid)
+                    }
                 }
-                .take(SCREENED_LIMIT)
-            qualified
+            }.awaitAll().toMap()
+
+            val spreadSurvivors = stage1.filter {
+                (spreads[it.symbol] ?: 100.0) < MAX_SPREAD_PCT
+            }
+
+            // ---- Stage 3: real candles → ATR + multi-horizon bias, bounded-parallel.
+            val semCandles = Semaphore(PARALLEL_SYMBOL_WORK)
+            val assets = spreadSurvivors.map { candidate ->
+                async {
+                    semCandles.withPermit {
+                        val lastPrice = candidate.ticker.lastPrice ?: candidate.premium?.markPrice ?: 0.0
+                        val fundingRate = candidate.premium?.lastFundingRate ?: 0.0
+
+                        // §9/§15: structural + momentum multi-horizon bias from real candles.
+                        val strategicBias = IndicatorMath.structuralBias(loadCandles(candidate.symbol, "4h", 60))
+                        val tacticalBias = IndicatorMath.structuralBias(loadCandles(candidate.symbol, "1h", 60))
+
+                        val regime = classifyRegime(strategicBias, tacticalBias)
+                        val pain = IndicatorMath.painScore(fundingRate, tacticalBias)
+                        val mid = lastPrice
+                        val premium = candidate.premium
+                        val index = premium?.indexPrice ?: mid
+                        val mark = premium?.markPrice ?: mid
+                        val basisFromBinance = if (index > 0.0 && mark > 0.0) {
+                            (mark - index) / index * 100.0 * 365.0
+                        } else 0.0
+                        val basisPremiumPct = when {
+                            basis.containsKey(candidate.symbol) -> basis[candidate.symbol]
+                            else -> basisFromBinance
+                        }
+                        val liq = liq[candidate.symbol] ?: Pair(0.0, 0.0)
+
+                        CryptoAsset(
+                            symbol = candidate.symbol,
+                            baseAsset = candidate.baseAsset,
+                            lastPrice = lastPrice,
+                            priceChange24h = candidate.ticker.priceChangePercent ?: 0.0,
+                            quoteVolume24h = candidate.ticker.quoteVolume ?: 0.0,
+                            orderBookSpreadPct = spreads[candidate.symbol] ?: 100.0,
+                            fundingRatePct = fundingRate,
+                            predictedFundingPct = premium?.lastFundingRate ?: fundingRate,
+                            openInterestUsd = ois[candidate.symbol] ?: 0.0,
+                            basisPremiumPct = basisPremiumPct,
+                            atr5m = atrFor(candidate.symbol, "5m", lastPrice),
+                            atr1h = atrFor(candidate.symbol, "1h", lastPrice),
+                            atr4h = atrFor(candidate.symbol, "4h", lastPrice),
+                            regime = regime,
+                            tacticalBias = tacticalBias,
+                            strategicBias = strategicBias,
+                            primaryPainPath = buildPainPath(
+                                pain,
+                                tacticalBias,
+                                strategicBias,
+                                liq.first,
+                                liq.second
+                            ),
+                            liquidationContext = liquidationContextFor(candidate.symbol, liq)
+                        )
+                    }
+                }
+            }.awaitAll()
+
+            // §6 Screener Output: full ranked list — every qualifying symbol ships.
+            assets.sortedByDescending { asset ->
+                IndicatorMath.painScore(asset.fundingRatePct, asset.tacticalBias) +
+                    Math.abs(asset.tacticalBias)
+            }
         }
     }
 
@@ -228,7 +304,18 @@ class UniverseScreener(private val candleDao: CandleDao) {
         else -> MarketRegime.BALANCE
     }
 
-    private fun buildPainPath(pain: Int, tactical: Int, strategic: Int): String {
+    private fun buildPainPath(
+        pain: Int,
+        tactical: Int,
+        strategic: Int,
+        longLiquidatedUsd24h: Double = 0.0,
+        shortLiquidatedUsd24h: Double = 0.0
+    ): String {
+        val heaviestSide = when {
+            longLiquidatedUsd24h > shortLiquidatedUsd24h * 1.8 -> "L-side flush"
+            shortLiquidatedUsd24h > longLiquidatedUsd24h * 1.8 -> "S-side flush"
+            else -> "no flush"
+        }
         val dir = when {
             tactical >= 20 && strategic >= 20 -> "Bull continuation"
             tactical <= -20 && strategic <= -20 -> "Bear continuation"
@@ -237,6 +324,18 @@ class UniverseScreener(private val candleDao: CandleDao) {
             else -> "Range rotation"
         }
         return "$dir (pain $pain)"
+    }
+
+    private fun liquidationContextFor(symbol: String, liq: Pair<Double, Double>): LiquidationContext {
+        return if (liq.first > 0.0 || liq.second > 0.0) {
+            LiquidationContext(
+                longLiquidatedUsd24h = liq.first,
+                shortLiquidatedUsd24h = liq.second,
+                lastUpdatedMs = System.currentTimeMillis()
+            )
+        } else {
+            LiquidationContext.EMPTY
+        }
     }
 
     private fun CandleEntity.toDomain() = BinanceFuturesClient.Candle(

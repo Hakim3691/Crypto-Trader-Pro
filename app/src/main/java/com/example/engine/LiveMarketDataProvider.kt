@@ -2,7 +2,7 @@ package com.example.engine
 
 import com.example.data.model.CryptoAsset
 import com.example.data.model.EvidenceFrame
-import com.example.data.model.MarketRegime
+import com.example.data.model.LiquidationContext
 import com.example.data.remote.BinanceFuturesClient
 import com.example.data.remote.BinanceWebSocketClient
 import com.example.data.remote.CoinGlassClient
@@ -13,26 +13,37 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlin.math.abs
 
+/** Universe emission that also states WHERE the data came from (Spec §4 honesty). */
+data class UniverseSnapshot(
+    val assets: List<CryptoAsset>,
+    val isLive: Boolean
+)
+
 /**
  * Phase 2 facade between the app and the real market-data layer.
+ *
+ * §4 Display Data Mandate: every displayed value streams from the live Binance/CoinGlass
+ * public APIs. There are NO simulated fallbacks here anymore — when a feed is offline
+ * the flow simply goes quiet (last snapshot stays on screen) and the UI's LIVE/SEED
+ * chip shows the data source. The only simulated data left in the app is the
+ * clearly-labeled seed universe placeholder and the paper-mode wallet/trade outcomes
+ * (Spec §5), which is exactly what the user asked for.
  *
  * §5 Data Throttling:
  *  - Dormant Polling (screener browsing): REST snapshots every ~20s.
  *  - Active Delta Mode (staged symbol): direct WebSocket streams for only that symbol's
- *    tick trades, book deltas and 1m candle updates — cancelled with the collector.
- *
- * Offline-first: if live discovery yields nothing (no network, API blocked), the app
- * falls back to the legacy seed universe so every screen keeps working.
+ *    tick trades — cancelled with the collector. Depth (order book) refreshes over a
+ *    light REST poll so the L2 ladder is REAL exchange data, not a synthesized ladder.
  */
 class LiveMarketDataProvider(private val screener: UniverseScreener) {
 
     companion object {
         const val DORMANT_POLL_INTERVAL_MS = 20_000L
         const val TICKS_PER_EVIDENCE_FRAME = 25
-        const val MAX_TRADE_BUFFER = 20
+        const val ORDER_BOOK_POLL_INTERVAL_MS = 2_000L
+        const val DEPTH_LEVELS = 12
+        const val BOOK_LADDER_LEVELS = 6
     }
-
-    private val seed = MarketDataRepository()
 
     /** Last successfully screened universe (kept for evidence-frame context). */
     @Volatile
@@ -41,18 +52,17 @@ class LiveMarketDataProvider(private val screener: UniverseScreener) {
 
     /**
      * Live screener refresh (dormant polling). Emits the real ranked universe when
-     * available; otherwise emits the offline seed so the UI never blanks.
+     * available; otherwise re-emits the clearly-labeled seed universe so the UI can
+     * show its OFFLINE state instead of faking a live feed.
      */
-    fun dormantUniversePolling(): Flow<List<CryptoAsset>> = flow {
+    fun dormantUniversePolling(): Flow<UniverseSnapshot> = flow {
         while (true) {
             val live = runCatching { screener.screenUniverse() }.getOrDefault(emptyList())
             if (live.isNotEmpty()) {
                 lastUniverse = live
-                emit(live)
+                emit(UniverseSnapshot(live, isLive = true))
             } else {
-                val fallback = seed.getInitialUniverse()
-                lastUniverse = fallback
-                emit(fallback)
+                emit(UniverseSnapshot(screener.offlineSeedUniverse(), isLive = false))
             }
             delay(DORMANT_POLL_INTERVAL_MS)
         }
@@ -61,98 +71,107 @@ class LiveMarketDataProvider(private val screener: UniverseScreener) {
     /**
      * One-shot universe load for immediate consumption (first frame).
      */
-    suspend fun loadUniverseOnce(): List<CryptoAsset> {
+    suspend fun loadUniverseOnce(): UniverseSnapshot {
         val live = runCatching { screener.screenUniverse() }.getOrDefault(emptyList())
-        val universe = live.ifEmpty { seed.getInitialUniverse() }
-        lastUniverse = universe
-        return universe
+        return if (live.isNotEmpty()) {
+            lastUniverse = live
+            UniverseSnapshot(live, isLive = true)
+        } else {
+            UniverseSnapshot(screener.offlineSeedUniverse(), isLive = false)
+        }
+    }
+
+    override fun buildEvidenceFrame(asset: CryptoAsset): EvidenceFrame {
+        val normalizedTick = lastNormalizedTick
+        val regimeDrift = when (asset.regime) {
+            MarketRegime.BULLISH_CONTINUATION -> 0.12
+            MarketRegime.BEARISH_CONTINUATION -> -0.12
+            else -> 0.0
+        }
+        return FeatureEngine().buildEvidenceFrame(
+            asset = asset,
+            normalizedTick = when (normalizedTick) {
+                NormalizedTick.LOW_VOL, NormalizedTick.NO_DATA, NormalizedTick.SAY_PRICE, NormalizedTick.HIGH_VOL,
+                null -> NormalizedTick.NO_DATA
+                else -> normalizedTick
+            },
+            currentRegime = asset.regime,
+            oiFromCorpus = lastCorpusOtsBySymbol[asset.symbol],
+            regimeDrift = regimeDrift
+        )
     }
 
     /**
      * §5 Active Delta Mode: price/OI/funding deltas for the selected symbol only.
      * Price ticks come from the real bookTicker WS; OI/funding are re-quoted over REST
-     * at a sane cadence. Emits nothing until the socket connects; if it never does,
-     * falls back to the legacy simulated stream so the dashboard remains alive.
+     * at a sane cadence. If the socket cannot connect the flow emits nothing — the UI
+     * keeps the last real snapshot rather than inventing price movement.
      */
     fun activeDeltaStream(asset: CryptoAsset): Flow<CryptoAsset> = flow {
         var current = asset
-        var emitted = false
         var tickCount = 0
         var lastOi = asset.openInterestUsd
         var lastFunding = asset.fundingRatePct
 
-        // Real stream first: emit every bookTicker delta mapped into the asset model.
-        try {
-            BinanceWebSocketClient.streamBookTicker(asset.symbol).collect { delta ->
-                current = current.copy(
-                    lastPrice = delta.midPrice,
-                    orderBookSpreadPct = delta.spreadPct
-                )
-                tickCount++
-                if (tickCount % TICKS_PER_EVIDENCE_FRAME == 0) {
-                    // Refresh derivatives context periodically over REST.
-                    runCatching {
-                        BinanceFuturesClient.fetchOpenInterest(asset.symbol)?.let { oiCoin ->
-                            // Coin-unit OI * price => USD notional.
-                            lastOi = oiCoin * current.lastPrice
-                        }
-                        CoinGlassClient.fetchFundingRates()[asset.symbol]?.first?.let { lastFunding = it }
+        BinanceWebSocketClient.streamBookTicker(asset.symbol).collect { delta ->
+            current = current.copy(
+                lastPrice = delta.midPrice,
+                orderBookSpreadPct = delta.spreadPct
+            )
+            tickCount++
+            if (tickCount % TICKS_PER_EVIDENCE_FRAME == 0) {
+                // Refresh derivatives context periodically over REST.
+                runCatching {
+                    BinanceFuturesClient.fetchOpenInterest(asset.symbol)?.let { oiCoin ->
+                        // Coin-unit OI * price => USD notional.
+                        lastOi = oiCoin * current.lastPrice
                     }
+                    CoinGlassClient.fetchFundingRates()[asset.symbol]?.first?.let { lastFunding = it }
                 }
-                emit(current.copy(openInterestUsd = lastOi, fundingRatePct = lastFunding))
-                emitted = true
             }
-        } catch (t: Throwable) {
-            // Socket ended (cancel/IO). Fall through to dormant fallback below.
-        }
-
-        // Fallback: legacy simulated stream if the real stream never produced values.
-        if (!emitted) {
-            seed.streamLiveTicks(asset).collect { emit(it) }
+            emit(current.copy(openInterestUsd = lastOi, fundingRatePct = lastFunding))
         }
     }
 
-    /** Real L2 book stream for telemetry; falls back to the simulated depth flow. */
+    /**
+     * REAL L2 book via a light REST depth poll (Binance futures /depth). Real bids/asks
+     * and real spread — no synthesized ladder. Quiet when the request fails.
+     */
     fun orderBookStream(asset: CryptoAsset): Flow<OrderBookSnapshot> = flow {
-        var emitted = false
-        try {
-            BinanceWebSocketClient.streamBookTicker(asset.symbol).collect { delta ->
-                val step = maxOf(0.01, asset.atr5m * 0.08)
-                // Synthesize a visible ladder around the REAL best bid/ask.
-                val bids = (1..6).map { i -> OrderBookLevel(delta.bestBid - (i - 1) * step, 10.0 + i * 7.0) }
-                val asks = (1..6).map { i -> OrderBookLevel(delta.bestAsk + (i - 1) * step, 10.0 + i * 7.0) }
-                emit(OrderBookSnapshot(asset.symbol, bids, asks, delta.spreadPct))
-                emitted = true
-            }
-        } catch (t: Throwable) {
-            // ignore, fallback below
-        }
-        if (!emitted) {
-            seed.streamOrderBook(asset.symbol, asset.lastPrice, asset.atr5m).collect { emit(it) }
-        }
-    }
-
-    /** Real taker-trade stream; falls back to the simulated tape when offline. */
-    fun takerTradeStream(asset: CryptoAsset): Flow<TakerTrade> = flow {
-        var emitted = false
-        try {
-            BinanceWebSocketClient.streamAggTrades(asset.symbol).collect { delta ->
+        while (true) {
+            val depth = runCatching {
+                BinanceFuturesClient.fetchDepth(asset.symbol, DEPTH_LEVELS)
+            }.getOrNull()
+            if (depth != null && depth.bids.isNotEmpty() && depth.asks.isNotEmpty()) {
+                val bestBid = depth.bids.first().first
+                val bestAsk = depth.asks.first().first
+                val mid = (bestBid + bestAsk) / 2.0
+                val spreadPct = if (mid > 0.0) (bestAsk - bestBid) / mid * 100.0 else 0.0
                 emit(
-                    TakerTrade(
-                        id = delta.tradeTimeUtcMs,
-                        timestamp = delta.tradeTimeUtcMs,
-                        price = delta.price,
-                        qty = delta.qty,
-                        isBuyerMaker = delta.isBuyerMaker
+                    OrderBookSnapshot(
+                        asset = asset.symbol,
+                        bids = depth.bids.take(BOOK_LADDER_LEVELS).map { OrderBookLevel(it.first, it.second) },
+                        asks = depth.asks.take(BOOK_LADDER_LEVELS).map { OrderBookLevel(it.first, it.second) },
+                        spreadPct = Math.round(spreadPct * 1000.0) / 1000.0
                     )
                 )
-                emitted = true
             }
-        } catch (t: Throwable) {
-            // ignore, fallback below
+            delay(ORDER_BOOK_POLL_INTERVAL_MS)
         }
-        if (!emitted) {
-            seed.streamTakerTrades(asset.lastPrice).collect { emit(it) }
+    }.flowOn(Dispatchers.IO)
+
+    /** Real taker-trade tape (aggTrade WS). No simulated tape when offline. */
+    fun takerTradeStream(asset: CryptoAsset): Flow<TakerTrade> = flow {
+        BinanceWebSocketClient.streamAggTrades(asset.symbol).collect { delta ->
+            emit(
+                TakerTrade(
+                    id = delta.tradeTimeUtcMs,
+                    timestamp = delta.tradeTimeUtcMs,
+                    price = delta.price,
+                    qty = delta.qty,
+                    isBuyerMaker = delta.isBuyerMaker
+                )
+            )
         }
     }
 

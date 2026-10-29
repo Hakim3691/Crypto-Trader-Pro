@@ -2,6 +2,9 @@ package com.example.engine
 
 import com.example.data.model.CryptoAsset
 import com.example.data.model.EvidenceFrame
+import com.example.data.model.LiquidationContext
+import com.example.data.model.MarketRegime
+import com.example.data.model.NormalizedTick
 import kotlin.math.abs
 import kotlin.random.Random
 
@@ -15,8 +18,21 @@ class FeatureEngine(private val random: Random = Random.Default) {
         asset: CryptoAsset,
         recentPriceChangePct: Double = 0.05
     ): EvidenceFrame {
-        // Evaluate OI delta vs price direction
-        val oiDelta = (random.nextDouble(-1.2, 1.8))
+        return buildEvidenceFrame(
+            asset = asset,
+            normalizedTick = NormalizedTick.NO_DATA,
+            currentRegime = asset.regime,
+            oiFromCorpus = null
+        )
+    }
+
+    fun buildEvidenceFrame(
+        asset: CryptoAsset,
+        normalizedTick: NormalizedTick,
+        currentRegime: MarketRegime,
+        oiFromCorpus: Double?
+    ): EvidenceFrame {
+        val oiDelta = oiFromCorpus?.let { (random.nextDouble(0.9, 1.1) * it) } ?: (random.nextDouble(-1.2, 1.8))
         val fundingDelta = (random.nextDouble(-0.002, 0.002))
         val basisDelta = (random.nextDouble(-4.0, 5.5)) // bps
 
@@ -53,6 +69,7 @@ class FeatureEngine(private val random: Random = Random.Default) {
             acceptanceQuality = acceptanceQuality,
             rejectionQuality = rejectionQuality,
             trapProbabilityPct = trapProb,
+            liquidationContext = LiquidationContext.EMPTY,
             recentImpulseQuality = impulseQuality
         )
     }

@@ -7,6 +7,26 @@ enum class MarketRegime(val label: String, val shortDesc: String) {
     BALANCE("Balance", "Rotating in value range; mean reversion favored")
 }
 
+enum class NormalizedTick(
+    val label: String,
+    val volatility: Double,
+    val impulse: Double
+) {
+    LOW_VOL(label = "low_vol", volatility = TICK_LOW_VOL, impulse = TICK_LOW_IMPACT),
+    HIGH_VOL(label = "high_vol", volatility = TICK_HIGH_VOL, impulse = TICK_HIGH_IMPACT),
+    SAY_PRICE(label = "say_price", volatility = TICK_FLAT, impulse = TICK_MID_IMPACT),
+    NO_DATA(label = "no_data", volatility = 0.0, impulse = 0.0);
+
+    companion object {
+        const val TICK_LOW_VOL = 0.0005
+        const val TICK_HIGH_VOL = 0.004
+        const val TICK_FLAT = 0.0
+        const val TICK_LOW_IMPACT = 0.2
+        const val TICK_HIGH_IMPACT = 0.8
+        const val TICK_MID_IMPACT = 0.5
+    }
+}
+
 enum class ZoneType(val displayName: String, val isLongAffinity: Boolean) {
     HTF_SUPPORT("HTF Support Band", true),
     HTF_RESISTANCE("HTF Resistance Band", false),
