@@ -1,78 +1,16 @@
 package com.example.engine
 
 import com.example.data.model.CryptoAsset
-import com.example.data.model.EvidenceFrame
-import com.example.data.model.LiquidationContext
-import com.example.data.model.MarketRegime
-import com.example.data.model.NormalizedTick
 import kotlin.math.abs
-import kotlin.random.Random
 
-class FeatureEngine(private val random: Random = Random.Default) {
-
-    /**
-     * Builds live evidence frame for cancellation and monitoring.
-     * The RNG is injectable so replay paths (Phase 5) stay deterministic.
-     */
-    fun buildEvidenceFrame(
-        asset: CryptoAsset,
-        recentPriceChangePct: Double = 0.05
-    ): EvidenceFrame {
-        return buildEvidenceFrame(
-            asset = asset,
-            normalizedTick = NormalizedTick.NO_DATA,
-            currentRegime = asset.regime,
-            oiFromCorpus = null
-        )
-    }
-
-    fun buildEvidenceFrame(
-        asset: CryptoAsset,
-        normalizedTick: NormalizedTick,
-        currentRegime: MarketRegime,
-        oiFromCorpus: Double?
-    ): EvidenceFrame {
-        val oiDelta = oiFromCorpus?.let { (random.nextDouble(0.9, 1.1) * it) } ?: (random.nextDouble(-1.2, 1.8))
-        val fundingDelta = (random.nextDouble(-0.002, 0.002))
-        val basisDelta = (random.nextDouble(-4.0, 5.5)) // bps
-
-        // Taker buy ratio (> 0.5 taker aggressive buying, < 0.5 selling)
-        val takerBuyRatio = when {
-            asset.tacticalBias > 40 -> random.nextDouble(0.55, 0.78)
-            asset.tacticalBias < -40 -> random.nextDouble(0.25, 0.48)
-            else -> random.nextDouble(0.42, 0.58)
-        }
-
-        val acceptanceQuality = if (asset.tacticalBias > 0) 0.72 else 0.38
-        val rejectionQuality = if (asset.tacticalBias < 0) 0.68 else 0.41
-
-        // Trap probability (high when price moves without volume or funding extreme)
-        val trapProb = when {
-            abs(asset.tacticalBias) > 70 && abs(asset.fundingRatePct) > 0.02 -> 68
-            abs(asset.tacticalBias) < 20 -> 24
-            else -> 42
-        }
-
-        val impulseQuality = when {
-            takerBuyRatio > 0.65 -> "High Taker Buy Dominance (Impulsive)"
-            takerBuyRatio < 0.35 -> "Heavy Taker Sell Pressure (Impulsive)"
-            else -> "Choppy Tape Rotation (Low Conviction)"
-        }
-
-        return EvidenceFrame(
-            timestamp = System.currentTimeMillis(),
-            asset = asset.symbol,
-            oiDelta1hPct = Math.round(oiDelta * 100.0) / 100.0,
-            fundingRateChangePct = Math.round(fundingDelta * 10000.0) / 10000.0,
-            basisDeltaBps = Math.round(basisDelta * 10.0) / 10.0,
-            takerBuyRatio = Math.round(takerBuyRatio * 100.0) / 100.0,
-            acceptanceQuality = acceptanceQuality,
-            rejectionQuality = rejectionQuality,
-            trapProbabilityPct = trapProb,
-            liquidationContext = LiquidationContext.EMPTY,
-            recentImpulseQuality = impulseQuality
-        )
-    }
+/**
+ * Directional analytics used by the path engine.
+ *
+ * Evidence frames are built by [LiveMarketDataProvider] from the live asset snapshot —
+ * this class intentionally holds no generator and no randomness, so every number that
+ * reaches the campaign library is reproducible from its inputs (Spec §4, §37).
+ */
+class FeatureEngine {
 
     /**
      * Calculates directional Pain Score based on funding, stop pools, and trapped positioning

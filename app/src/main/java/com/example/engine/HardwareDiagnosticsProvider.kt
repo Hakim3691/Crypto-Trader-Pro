@@ -53,7 +53,14 @@ class HardwareDiagnosticsProvider(
         /** Sentinel returned when an endpoint is unreachable; feeds `isFeedStale` upstream. */
         const val UNREACHABLE_LATENCY_MS = 9_999L
 
-        /** Spec §2: MODERATE throttling or worse suppresses staging and cancellation. */
+        /**
+         * Spec §2: MODERATE throttling or worse suppresses staging and cancellation.
+         *
+         * `THERMAL_STATUS_MODERATE` is API 29+, but this is a `const val`: the value is
+         * inlined at compile time, so there is no runtime field lookup on older devices.
+         * [isDeviceThermallyThrottled] returns false below API 30 before reading it.
+         */
+        @android.annotation.SuppressLint("InlinedApi")
         private const val THERMAL_THROTTLE_THRESHOLD = PowerManager.THERMAL_STATUS_MODERATE
 
         suspend fun defaultLatencyProbe(url: String): Long = withContext(Dispatchers.IO) {

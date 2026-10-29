@@ -15,7 +15,6 @@ import com.example.data.remote.BinanceFuturesClient
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.random.Random
 
 /**
  * Phase 5 (Spec §37): deterministic historical replay of the full proactive pipeline —
@@ -34,7 +33,7 @@ import kotlin.random.Random
 class ReplayEngine(
     private val invalidationEngine: InvalidationEngine = InvalidationEngine(),
     private val executionEngine: ExecutionEngine = ExecutionEngine(RiskEngine()),
-    private val featureEngine: FeatureEngine = FeatureEngine(Random(0x501A5EEDL))
+    private val featureEngine: FeatureEngine = FeatureEngine()
 ) {
 
     companion object {

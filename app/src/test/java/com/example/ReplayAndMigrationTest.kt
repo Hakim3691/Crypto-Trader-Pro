@@ -1,12 +1,28 @@
 package com.example
 
-import com.example.data.local.AppDatabase
-import com.example.data.local.CandleEntity
-import com.example.engine.ExecutionGuardrails.PositionMismatchAction
-import com.example.engine.IndicatorMath.BiasBand
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
-import android.content.Context
+import com.example.data.local.AppDatabase
+import com.example.data.local.CandleEntity
+import com.example.data.model.BoardRole
+import com.example.data.model.Campaign
+import com.example.data.model.CampaignFamily
+import com.example.data.model.CampaignState
+import com.example.data.model.CryptoAsset
+import com.example.data.model.LadderSlice
+import com.example.data.model.MarketRegime
+import com.example.data.model.StopLogic
+import com.example.data.remote.BinanceFuturesClient
+import com.example.engine.ExecutionEngine
+import com.example.engine.ExecutionGuardrails
+import com.example.engine.ExecutionGuardrails.PositionMismatchAction
+import com.example.engine.IndicatorMath
+import com.example.engine.IndicatorMath.BiasBand
+import com.example.engine.ReplayEngine
+import com.example.engine.RiskEngine
+import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -15,15 +31,13 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
-import kotlinx.coroutines.runBlocking
 
 /**
- * Phase 5 verification + Room v1→v2 migration test (Spec §5, §37).
+ * Feature: replay determinism, Room v1→v2 migration and the execution/analytics helpers
+ * (Spec §5, §15, §22, §33, §36, §37).
  *
- * The migration test opens a hand-built version-1 database (the three original
- * tables with seeded rows), runs [AppDatabase.MIGRATION_1_2] against it, then
- * re-validates the schema and asserts user data survived the upgrade — the
- * guarantee the destructive fallback used to erase.
+ * Background: every scenario runs under Robolectric with an in-memory database opened by
+ * [openDatabase], so each test starts from an empty, isolated store.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -32,7 +46,7 @@ class ReplayAndMigrationTest {
     private lateinit var db: AppDatabase
 
     @Before
-    fun setUp() {
+    fun openDatabase() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
@@ -40,35 +54,45 @@ class ReplayAndMigrationTest {
     }
 
     @After
-    fun tearDown() {
+    fun closeDatabase() {
         db.close()
     }
 
     // ------------------------------------------------------------ candle store
 
     @Test
-    fun `candle store round-trips rows and replaces on primary key conflict`() = runBlocking {
+    fun `should round-trip candles and replace rows on primary key conflict`() = runBlocking {
+        // given candles stored for two symbols over two SOL hours
         val dao = db.candleDao()
         val now = 1_700_000_000_000L
-        val rows = listOf(
-            candle("SOLUSDT", "1h", now, close = 150.0, fetchedAt = now),
-            candle("SOLUSDT", "1h", now + 3_600_000, close = 152.0, fetchedAt = now),
-            candle("BTCUSDT", "4h", now, close = 60_000.0, fetchedAt = now)
+        dao.insertCandles(
+            listOf(
+                candle("SOLUSDT", "1h", now, close = 150.0, fetchedAt = now),
+                candle("SOLUSDT", "1h", now + 3_600_000, close = 152.0, fetchedAt = now),
+                candle("BTCUSDT", "4h", now, close = 60_000.0, fetchedAt = now)
+            )
         )
-        dao.insertCandles(rows)
 
+        // when the SOL 1h series is read back
         val sol = dao.getCandles("SOLUSDT", "1h")
+
+        // then both rows exist and the watermark is the newest fetch
         assertEquals(2, sol.size)
         assertEquals(150.0, sol.first().close, 1e-9)
         assertEquals(now, dao.getLatestFetchedAtMs("SOLUSDT", "1h"))
 
-        // §5 staleness re-download path: REPLACE on the same primary key, no duplicates.
+        // when a §5 staleness re-download rewrites the same primary key
         dao.insertCandles(listOf(candle("SOLUSDT", "1h", now, close = 151.0, fetchedAt = now + 5)))
+
+        // then the row is replaced, never duplicated
         val after = dao.getCandles("SOLUSDT", "1h")
         assertEquals(2, after.size)
         assertEquals(151.0, after.first { it.openTimeUtcMs == now }.close, 1e-9)
 
+        // when the SOL 1h cache is cleared
         dao.clearCandles("SOLUSDT", "1h")
+
+        // then only that symbol/interval is gone
         assertEquals(0, dao.getCandles("SOLUSDT", "1h").size)
         assertEquals(1, dao.getCandles("BTCUSDT", "4h").size)
         Unit
@@ -98,16 +122,15 @@ class ReplayAndMigrationTest {
     // ------------------------------------------------------------ migration
 
     @Test
-    fun `migration 1 to 2 preserves user rows and adds candle table`() {
+    fun `should preserve user rows and add the candle table when migrating 1 to 2`() {
+        // given a hand-built version-1 install seeded with real user data
         val context = ApplicationProvider.getApplicationContext<Context>()
         val dbName = "migration-test-db"
         context.deleteDatabase(dbName)
 
-        // Hand-build the version-1 install with raw framework SQLite: the three original
-        // tables (all unchanged since v1) at PRAGMA version 1, seeded with user data.
         val dbFile = context.getDatabasePath(dbName)
         dbFile.parentFile?.mkdirs()
-        val v1 = android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(dbFile, null)
+        val v1 = SQLiteDatabase.openOrCreateDatabase(dbFile, null)
         try {
             v1.version = 1
             v1.execSQL(V1_ASSETS_DDL)
@@ -128,18 +151,21 @@ class ReplayAndMigrationTest {
             v1.close()
         }
 
-        // Re-open through the real migration path and validate.
-        val migrated = androidx.room.Room.databaseBuilder(context, AppDatabase::class.java, dbName)
+        // when Room re-opens the same file through the real migration path
+        val migrated = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
             .addMigrations(AppDatabase.MIGRATION_1_2)
             .allowMainThreadQueries()
             .build()
         try {
+            // then the reported schema version is 2
             assertEquals(2, migrated.openHelper.readableDatabase.version)
-            // §5 heavy-data table created by the migration, on the correct schema.
+
+            // and the §5 heavy-data table exists on the migrated schema
             migrated.openHelper.readableDatabase.query("SELECT count(*) FROM htf_candles").use { c ->
                 assertTrue(c.moveToFirst())
             }
-            // User data survived the upgrade instead of being wiped.
+
+            // and the seeded user rows survived instead of being wiped
             migrated.openHelper.readableDatabase.query("SELECT symbol FROM crypto_assets").use { cursor ->
                 assertTrue(cursor.moveToFirst())
                 assertEquals("SOLUSDT", cursor.getString(0))
@@ -180,7 +206,7 @@ class ReplayAndMigrationTest {
 
     // ------------------------------------------------------------ replay determinism
 
-    private fun replayAsset(price: Double) = com.example.data.model.CryptoAsset(
+    private fun replayAsset(price: Double) = CryptoAsset(
         symbol = "SOLUSDT",
         baseAsset = "SOL",
         lastPrice = price,
@@ -194,15 +220,15 @@ class ReplayAndMigrationTest {
         atr5m = price * 0.004,
         atr1h = price * 0.012,
         atr4h = price * 0.03,
-        regime = com.example.data.model.MarketRegime.BALANCE,
+        regime = MarketRegime.BALANCE,
         tacticalBias = 10,
         strategicBias = 5,
         primaryPainPath = "Range rotation"
     )
 
     /** 60 candles: 50 chop, then a 10-candle directional impulse leg. */
-    private fun impulseCandles(startPrice: Double, count: Int = 60): List<com.example.data.remote.BinanceFuturesClient.Candle> {
-        val out = mutableListOf<com.example.data.remote.BinanceFuturesClient.Candle>()
+    private fun impulseCandles(startPrice: Double, count: Int = 60): List<BinanceFuturesClient.Candle> {
+        val out = mutableListOf<BinanceFuturesClient.Candle>()
         var price = startPrice
         var t = 1_700_000_000_000L
         repeat(count) { i ->
@@ -210,7 +236,7 @@ class ReplayAndMigrationTest {
             val open = price
             val close = price + drift
             out.add(
-                com.example.data.remote.BinanceFuturesClient.Candle(
+                BinanceFuturesClient.Candle(
                     openTimeUtcMs = t,
                     open = open,
                     high = maxOf(open, close) * 1.001,
@@ -228,38 +254,48 @@ class ReplayAndMigrationTest {
     }
 
     @Test
-    fun `replay is deterministic across runs`() {
-        val engine = com.example.engine.ReplayEngine()
+    fun `should replay identical results on every run of the same history`() {
+        // given one fixture history and two independent runs
+        val engine = ReplayEngine()
         val candles = impulseCandles(150.0)
-        val a = engine.replay(replayAsset(150.0), candles)
-        val b = engine.replay(replayAsset(150.0), candles)
-        assertEquals(a.totalTicks, b.totalTicks)
-        assertEquals(a.metrics.totalPnlUsd, b.metrics.totalPnlUsd, 0.0)
-        assertEquals(a.metrics.replayedCampaigns, b.metrics.replayedCampaigns)
+
+        // when the same history is replayed twice
+        val first = engine.replay(replayAsset(150.0), candles)
+        val second = engine.replay(replayAsset(150.0), candles)
+
+        // then every observable output matches exactly
+        assertEquals(first.totalTicks, second.totalTicks)
+        assertEquals(first.metrics.totalPnlUsd, second.metrics.totalPnlUsd, 0.0)
+        assertEquals(first.metrics.replayedCampaigns, second.metrics.replayedCampaigns)
         assertEquals(
-            a.campaigns.map { it.pnlUsd },
-            b.campaigns.map { it.pnlUsd }
+            first.campaigns.map { it.pnlUsd },
+            second.campaigns.map { it.pnlUsd }
         )
     }
 
     @Test
-    fun `replay resolves every staged board and fills on trade-through`() {
-        val engine = com.example.engine.ReplayEngine()
+    fun `should resolve every staged board and report mark-to-market pnl`() {
+        // given a chopped-then-impulse history
+        val engine = ReplayEngine()
+
+        // when it is replayed
         val result = engine.replay(replayAsset(150.0), impulseCandles(150.0))
-        // Every planned board produced a report (§37 per-template coverage).
+
+        // then every planned board produced a report (§37 per-template coverage)
         assertEquals(result.metrics.replayedCampaigns, result.campaigns.size)
         assertTrue(result.metrics.replayedCampaigns >= 4)
         assertTrue(result.totalTicks > 0)
-        // Choppiness before the impulse means some passive boards touched their zones.
         assertTrue(result.metrics.filledSliceCount >= 0)
-        // No board escaped mark-to-market: PnL equals the sum of per-board PnL.
+
+        // and no board escaped mark-to-market: total PnL is the sum of per-board PnL
         val sum = result.campaigns.sumOf { it.pnlUsd }
         assertEquals(result.metrics.totalPnlUsd, Math.round(sum * 100.0) / 100.0, 0.011)
     }
 
     @Test
-    fun `replay degrades gracefully without crowding and liquidity feeds`() {
-        val engine = com.example.engine.ReplayEngine()
+    fun `should complete and flag the run when crowding and liquidity feeds are absent`() {
+        // given two runs: one fed real funding/spread, one without them
+        val engine = ReplayEngine()
         val fed = engine.replay(
             replayAsset(150.0),
             impulseCandles(150.0),
@@ -267,29 +303,33 @@ class ReplayAndMigrationTest {
             spreadPct = 0.04
         )
         val degraded = engine.replay(replayAsset(150.0), impulseCandles(150.0))
-        // §37 optional-metrics mandate: the run completes and flags the degradation.
+
+        // then §37 honest degradation: the unfed run completes, ticks, and says it degraded
         assertTrue(degraded.totalTicks > 0)
         assertTrue(degraded.degradedFeeds)
         assertTrue(!fed.degradedFeeds)
-        // Notably, the exact deterministic feeds are folded into the seeded run, so the
-        // two runs may differ — but both must produce stable, finite metrics.
+
+        // and both runs produce finite metrics
         assertTrue(fed.metrics.totalPnlUsd.isFinite())
         assertTrue(degraded.metrics.totalPnlUsd.isFinite())
     }
 
     @Test
-    fun `symmetric baseline differs from proactive run and edge is reported`() {
-        val engine = com.example.engine.ReplayEngine()
+    fun `should keep the proactive run distinct from the symmetric baseline`() {
+        // given the same history replayed proactively and in baseline mode
+        val engine = ReplayEngine()
         val vmLike = engine.replay(replayAsset(150.0), impulseCandles(150.0))
         val baseline = engine.replay(
             replayAsset(150.0),
             impulseCandles(150.0),
             baselineMode = true
         )
-        // Baseline equalizes board sizes; the proactive run preserves role asymmetry.
+
+        // when the filled notionals of both runs are inspected
         val proactiveSizes = vmLike.campaigns.map { it.filledNotionalUsd }.distinct()
         val baselineSizes = baseline.campaigns.map { it.filledNotionalUsd }.distinct()
-        // §37 comparison inputs exist on both sides (even if PnL coincides).
+
+        // then §37 comparison inputs exist on both sides and both totals are finite
         assertTrue(proactiveSizes.isNotEmpty())
         assertTrue(baselineSizes.isNotEmpty())
         assertTrue(baseline.metrics.totalPnlUsd.isFinite())
@@ -297,10 +337,15 @@ class ReplayAndMigrationTest {
     }
 
     @Test
-    fun `replay rejects insufficient history with an empty result`() {
-        val engine = com.example.engine.ReplayEngine()
+    fun `should reject a replay when history is insufficient`() {
+        // given only 10 candles, below the minimum history
+        val engine = ReplayEngine()
         val short = impulseCandles(150.0, count = 10)
+
+        // when the replay runs
         val result = engine.replay(replayAsset(150.0), short)
+
+        // then it produces an empty result instead of inventing numbers
         assertEquals(0, result.metrics.replayedCampaigns)
         assertEquals(0, result.totalTicks)
         assertTrue(result.campaigns.isEmpty())
@@ -309,30 +354,33 @@ class ReplayAndMigrationTest {
     // ------------------------------------------------------------ analytics
 
     @Test
-    fun `swing points detect fractal extremes on a synthetic w-shape`() {
-        // low-high-low-high... sequence with flat runs between pivots. Wick extremes
-        // equal the close so asserted pivot prices are exact.
-        fun candleAt(price: Double, t: Long) = com.example.data.remote.BinanceFuturesClient.Candle(
+    fun `should detect fractal swing extremes on a synthetic w-shape`() {
+        // given a low-high-low-high sequence of flat-range candles
+        fun candleAt(price: Double, t: Long) = BinanceFuturesClient.Candle(
             openTimeUtcMs = t, open = price, high = price,
             low = price, close = price, volume = 1.0,
             closeTimeUtcMs = t + 1, quoteVolume = price
         )
         val prices = listOf(100.0, 95.0, 100.0, 105.0, 100.0, 95.0, 100.0, 105.0, 100.0)
         val candles = prices.mapIndexed { i, p -> candleAt(p, 1_700_000_000_000L + i * 60_000L) }
-        val swings = com.example.engine.IndicatorMath.swingPoints(candles, window = 2)
-        // With window=2 the troughs at index 1 and 5 (or 1..) are strict lows.
+
+        // when swing points are extracted with a 2-candle window
+        val swings = IndicatorMath.swingPoints(candles, window = 2)
         val lows = swings.filter { !it.isHigh }.map { it.price }.distinct()
         val highs = swings.filter { it.isHigh }.map { it.price }.distinct()
+
+        // then the 95 trough and the 105 peak are both found
         assertTrue(lows.contains(95.0))
         assertTrue(highs.contains(105.0))
     }
 
     @Test
-    fun `structural bias separates uptrend from downtrend history`() {
-        fun leg(prices: List<Double>): List<com.example.data.remote.BinanceFuturesClient.Candle> {
+    fun `should separate an uptrend from a downtrend by structural bias`() {
+        // given two 40-candle legs of equal slope, one rising and one falling
+        fun leg(prices: List<Double>): List<BinanceFuturesClient.Candle> {
             var t = 1_700_000_000_000L
             return prices.map { p ->
-                val c = com.example.data.remote.BinanceFuturesClient.Candle(
+                val c = BinanceFuturesClient.Candle(
                     openTimeUtcMs = t, open = p * 0.999, high = p * 1.001,
                     low = p * 0.998, close = p, volume = 10.0,
                     closeTimeUtcMs = t + 1, quoteVolume = p
@@ -343,17 +391,22 @@ class ReplayAndMigrationTest {
         }
         val up = (1..40).map { 100.0 + it * 0.5 }
         val down = (1..40).map { 120.0 - it * 0.5 }
-        val upBias = com.example.engine.IndicatorMath.structuralBias(leg(up))
-        val downBias = com.example.engine.IndicatorMath.structuralBias(leg(down))
+
+        // when the structural bias of each leg is computed
+        val upBias = IndicatorMath.structuralBias(leg(up))
+        val downBias = IndicatorMath.structuralBias(leg(down))
+
+        // then the uptrend is positive, the downtrend negative, and the uptrend ranks higher
         assertTrue("expected up bias > 0, got $upBias", upBias > 0)
         assertTrue("expected down bias < 0, got $downBias", downBias < 0)
         assertTrue(upBias > downBias)
     }
 
     @Test
-    fun `coin calibration is clamped and finite on adversarial input`() {
+    fun `should clamp coin calibration to finite bands on adversarial input`() {
+        // given 40 alternating zero-wick impulses and flat candles
         fun candle(body: Double, wickUp: Double, wickDown: Double, t: Long) =
-            com.example.data.remote.BinanceFuturesClient.Candle(
+            BinanceFuturesClient.Candle(
                 openTimeUtcMs = t,
                 open = 100.0,
                 high = 100.0 + wickUp + maxOf(body, 0.0),
@@ -363,89 +416,102 @@ class ReplayAndMigrationTest {
                 closeTimeUtcMs = t + 1,
                 quoteVolume = 1_000.0
             )
-        // Alternating zero-wick impulses and flat candles: stress the clamps.
         val candles = (0 until 40).map { i ->
             candle(if (i % 2 == 0) 2.0 else -2.0, 0.0, 0.0, 1_700_000_000_000L + i * 60_000L)
         }
-        val cal = com.example.engine.IndicatorMath.computeCalibration(
+
+        // when calibration is computed
+        val calibration = IndicatorMath.computeCalibration(
             symbol = "TESTUSDT",
             candles1h = candles,
             candles5m = candles,
             atr5m = 2.0,
             spreadPct = 0.05
         )
-        assertTrue(cal.impulseAsymmetry in 0.2..5.0)
-        assertTrue(cal.wickAsymmetry in 0.2..5.0)
-        assertTrue(cal.followThroughAsymmetry in 0.2..5.0)
-        assertTrue(cal.crowdingElasticity in 0.2..5.0)
-        assertTrue(cal.meanReversionHalfLifeMinutes in 5..240)
-        assertTrue(cal.typicalSlippageBps in 0.5..50.0)
+
+        // then every factor stays inside its documented clamp
+        assertTrue(calibration.impulseAsymmetry in 0.2..5.0)
+        assertTrue(calibration.wickAsymmetry in 0.2..5.0)
+        assertTrue(calibration.followThroughAsymmetry in 0.2..5.0)
+        assertTrue(calibration.crowdingElasticity in 0.2..5.0)
+        assertTrue(calibration.meanReversionHalfLifeMinutes in 5..240)
+        assertTrue(calibration.typicalSlippageBps in 0.5..50.0)
     }
 
     @Test
-    fun `bias band table maps scores per spec 15`() {
-        with(com.example.engine.IndicatorMath.BiasBand) {
-            assertEquals(BiasBand.STRONG_BULL, of(60))
-            assertEquals(BiasBand.BULL, of(30))
-            assertEquals(BiasBand.NEUTRAL, of(0))
-            assertEquals(BiasBand.BEAR, of(-30))
-            assertEquals(BiasBand.STRONG_BEAR, of(-60))
-        }
+    fun `should map bias scores onto the spec 15 band table`() {
+        // given the documented score thresholds
+        val table = BiasBand
+
+        // then each threshold maps to its band
+        assertEquals(BiasBand.STRONG_BULL, table.of(60))
+        assertEquals(BiasBand.BULL, table.of(30))
+        assertEquals(BiasBand.NEUTRAL, table.of(0))
+        assertEquals(BiasBand.BEAR, table.of(-30))
+        assertEquals(BiasBand.STRONG_BEAR, table.of(-60))
     }
 
     @Test
-    fun `paper fill gate and reconciliation route by client order id`() {
-        val engine = com.example.engine.ExecutionEngine(com.example.engine.RiskEngine())
-        val slice = com.example.data.model.LadderSlice(1, 100.0, 1.0, 100.0, isResting = true)
-        val campaign = com.example.data.model.Campaign(
+    fun `should gate paper fills by trade-through and reconcile by client order id`() {
+        // given a staged long board resting a single bid at 100
+        val engine = ExecutionEngine(RiskEngine())
+        val slice = LadderSlice(1, 100.0, 1.0, 100.0, isResting = true)
+        val campaign = Campaign(
             id = "SOLUSDT_SUPPORT_LONG",
             asset = "SOLUSDT",
-            family = com.example.data.model.CampaignFamily.SUPPORT_LONG,
-            regime = com.example.data.model.MarketRegime.BALANCE,
-            role = com.example.data.model.BoardRole.PRIMARY,
+            family = CampaignFamily.SUPPORT_LONG,
+            regime = MarketRegime.BALANCE,
+            role = BoardRole.PRIMARY,
             priorityScore = 80.0,
             sizeBudgetUsd = 500.0,
             sizeMultiplier = 1.0,
             entryLadder = listOf(slice),
-            stopLogic = com.example.data.model.StopLogic(45, 70, 95.0),
+            stopLogic = StopLogic(softThreshold = 45, hardThreshold = 70, hardStopPrice = 95.0),
             targets = emptyList(),
             invalidationScore = 10,
             topReasons = emptyList(),
-            status = com.example.data.model.CampaignState.STAGED
+            status = CampaignState.STAGED
         )
-        // §36 paper fill: long passive limit fills when price trades through the bid.
+
+        // when price trades through the bid
         val filled = engine.simulatePaperFills(campaign, lastPrice = 99.0)
-        assertEquals(com.example.data.model.CampaignState.ACTIVE, filled.status)
+
+        // then the board activates and the slice fills (§36)
+        assertEquals(CampaignState.ACTIVE, filled.status)
         assertTrue(filled.entryLadder.first().isFilled)
-        // No fill when price stays above the bid.
+
+        // and when price stays above the bid, nothing fills
         val untouched = engine.simulatePaperFills(campaign, lastPrice = 101.0)
         assertTrue(untouched.entryLadder.first().isResting)
-        // §22/§25 reconciliation by encoded client order id.
+
+        // and §22/§25 reconciliation by encoded client order id fills or cancels it
         val reconciled = engine.reconcileFill(campaign, "SOLUSDT_SUPPORT_LONG_1")
         assertTrue(reconciled.entryLadder.first().isFilled)
         val cancelled = engine.reconcileCancel(campaign, "SOLUSDT_SUPPORT_LONG_1")
         assertTrue(!cancelled.entryLadder.first().isResting)
-        // Unknown ids leave the campaign untouched.
+
+        // and unknown ids leave the campaign untouched
         assertEquals(campaign, engine.reconcileFill(campaign, "OTHER_CAMPAIGN_9"))
         assertEquals(campaign, engine.reconcileCancel(campaign, "OTHER_CAMPAIGN_9"))
     }
 
     @Test
-    fun `guardrails compute position mismatch and reject pausing`() {
-        with(com.example.engine.ExecutionGuardrails) {
-            // Zero-vs-flat is fine; 5% relative delta is a mismatch (§33).
-            assertEquals(
-                PositionMismatchAction.NONE,
-                positionMismatchAction(0.0, 0.0)
-            )
+    fun `should compute position mismatch and reject the pause threshold`() {
+        // given the §33 5% relative-delta mismatch rule
+        with(ExecutionGuardrails) {
+            // then zero-vs-flat is fine
+            assertEquals(PositionMismatchAction.NONE, positionMismatchAction(0.0, 0.0))
+
+            // and a 10% relative delta flattens and locks
             assertEquals(
                 PositionMismatchAction.FLATTEN_AND_LOCK,
                 positionMismatchAction(2.0, 2.2)
             )
-            assertEquals(
-                PositionMismatchAction.NONE,
-                positionMismatchAction(2.0, 2.04)
-            )
+
+            // and a 2% relative delta passes
+            assertEquals(PositionMismatchAction.NONE, positionMismatchAction(2.0, 2.04))
+
+            // and the venue pauses exactly at the reject threshold, not one below it
             assertTrue(shouldPauseVenue(REJECT_PAUSE_THRESHOLD))
             assertTrue(!shouldPauseVenue(REJECT_PAUSE_THRESHOLD - 1))
         }

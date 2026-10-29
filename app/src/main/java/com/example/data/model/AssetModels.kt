@@ -7,6 +7,15 @@ enum class MarketRegime(val label: String, val shortDesc: String) {
     BALANCE("Balance", "Rotating in value range; mean reversion favored")
 }
 
+// File-level constants: enum entry initializers run before their own companion
+// object, so these cannot live on NormalizedTick.Companion.
+private const val TICK_LOW_VOL = 0.0005
+private const val TICK_HIGH_VOL = 0.004
+private const val TICK_FLAT = 0.0
+private const val TICK_LOW_IMPACT = 0.2
+private const val TICK_HIGH_IMPACT = 0.8
+private const val TICK_MID_IMPACT = 0.5
+
 enum class NormalizedTick(
     val label: String,
     val volatility: Double,
@@ -15,16 +24,7 @@ enum class NormalizedTick(
     LOW_VOL(label = "low_vol", volatility = TICK_LOW_VOL, impulse = TICK_LOW_IMPACT),
     HIGH_VOL(label = "high_vol", volatility = TICK_HIGH_VOL, impulse = TICK_HIGH_IMPACT),
     SAY_PRICE(label = "say_price", volatility = TICK_FLAT, impulse = TICK_MID_IMPACT),
-    NO_DATA(label = "no_data", volatility = 0.0, impulse = 0.0);
-
-    companion object {
-        const val TICK_LOW_VOL = 0.0005
-        const val TICK_HIGH_VOL = 0.004
-        const val TICK_FLAT = 0.0
-        const val TICK_LOW_IMPACT = 0.2
-        const val TICK_HIGH_IMPACT = 0.8
-        const val TICK_MID_IMPACT = 0.5
-    }
+    NO_DATA(label = "no_data", volatility = 0.0, impulse = 0.0)
 }
 
 enum class ZoneType(val displayName: String, val isLongAffinity: Boolean) {
@@ -104,7 +104,8 @@ data class CryptoAsset(
     val tacticalBias: Int,           // -100 to +100
     val strategicBias: Int,          // -100 to +100
     val primaryPainPath: String,
-    val venueHealthScore: Int = 98   // 0-100
+    val venueHealthScore: Int = 98,  // 0-100
+    val liquidationContext: LiquidationContext = LiquidationContext.EMPTY
 ) {
     val isMidCapQualified: Boolean
         get() = quoteVolume24h in 50_000_000.0..750_000_000.0 && orderBookSpreadPct < 0.10
