@@ -12,12 +12,12 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 /**
- * §5 Paper-wallet accounting: deterministic PnL/exposure math driven by ladder fills.
+ * Feature: paper-wallet accounting (Spec §5).
  *
- * Short-sell PnL convention used by the paper wallet (matches `Realized PnL` in the
- * spec's campaign accounting): a short profits when the exit price rises and loses when
- * it falls, i.e. `realized = direction * (exit - entry) * qty` with `direction = -1` for
- * shorts. This is the same sign convention as `PaperPnl.realizedPnlAtFlatten`.
+ * Deterministic PnL/exposure math driven by ladder fills. Sign convention shared with
+ * `PaperPnl.realizedPnlAtFlatten`:
+ * `realized = direction * (exit - entry) * qty`, with `direction = +1` for longs and
+ * `-1` for shorts — so a short profits when the exit price falls below its entry.
  */
 class PaperPnlTest {
 
@@ -60,52 +60,94 @@ class PaperPnlTest {
     }
 
     @Test
-    fun `exposure counts only filled slices`() {
+    fun `should count only filled slices toward open exposure`() {
+        // given a long board with a $600 filled slice and a $300 resting slice
         val campaigns = listOf(
             campaign(isLong = true, filled = listOf(Triple(150.0, 4.0, 600.0)), unfilledNotional = 300.0)
         )
-        assertEquals(600.0, PaperPnl.openExposureUsd(campaigns), 1e-9)
+
+        // when exposure is measured
+        val exposure = PaperPnl.openExposureUsd(campaigns)
+
+        // then the resting slice contributes nothing
+        assertEquals(600.0, exposure, 1e-9)
     }
 
     @Test
-    fun `no fills means zero exposure and zero pnl`() {
+    fun `should report zero exposure and zero pnl when nothing is filled`() {
+        // given a board whose only slice is still resting
         val campaigns = listOf(campaign(isLong = true, filled = emptyList(), unfilledNotional = 500.0))
-        assertEquals(0.0, PaperPnl.openExposureUsd(campaigns), 1e-9)
-        assertEquals(0.0, PaperPnl.unrealizedPnlUsd(campaigns, 151.0), 1e-9)
-        assertEquals(0.0, PaperPnl.realizedPnlAtFlatten(campaigns.first(), 148.0), 1e-9)
+
+        // when exposure, unrealized PnL and flatten PnL are computed
+        val exposure = PaperPnl.openExposureUsd(campaigns)
+        val unrealized = PaperPnl.unrealizedPnlUsd(campaigns, 151.0)
+        val realized = PaperPnl.realizedPnlAtFlatten(campaigns.first(), 148.0)
+
+        // then every figure is flat
+        assertEquals(0.0, exposure, 1e-9)
+        assertEquals(0.0, unrealized, 1e-9)
+        assertEquals(0.0, realized, 1e-9)
     }
 
     @Test
-    fun `unrealized pnl is direction aware`() {
+    fun `should sign unrealized pnl by direction`() {
+        // given an identical 4-unit fill held long and short
         val long = listOf(campaign(isLong = true, filled = listOf(Triple(150.0, 4.0, 600.0))))
         val short = listOf(campaign(isLong = false, filled = listOf(Triple(150.0, 4.0, 600.0))))
-        // Price 151: long is +4.0 (qty 4 * +1), short is -4.0.
-        assertEquals(4.0, PaperPnl.unrealizedPnlUsd(long, 151.0), 1e-9)
-        assertEquals(-4.0, PaperPnl.unrealizedPnlUsd(short, 151.0), 1e-9)
+
+        // when the mark moves one unit above entry (150 -> 151)
+        val longPnl = PaperPnl.unrealizedPnlUsd(long, 151.0)
+        val shortPnl = PaperPnl.unrealizedPnlUsd(short, 151.0)
+
+        // then the long gains 4.0 and the short loses 4.0
+        assertEquals(4.0, longPnl, 1e-9)
+        assertEquals(-4.0, shortPnl, 1e-9)
     }
 
     @Test
-    fun `realized flatten at stop books loss for long and gain for short`() {
+    fun `should book a loss for a long and a gain for a short flattened at the stop`() {
+        // given 2-unit fills at 150 on both sides
         val long = campaign(isLong = true, filled = listOf(Triple(150.0, 2.0, 300.0)))
         val short = campaign(isLong = false, filled = listOf(Triple(150.0, 2.0, 300.0)))
-        // Long flat at 148 vs 150 entry => loss of 2.0/unit * 2 units = -4.0.
-        assertEquals(-4.0, PaperPnl.realizedPnlAtFlatten(long, 148.0), 1e-9)
+
+        // when both are flattened two units below entry (150 -> 148)
+        val longPnl = PaperPnl.realizedPnlAtFlatten(long, 148.0)
+        val shortPnl = PaperPnl.realizedPnlAtFlatten(short, 148.0)
+
+        // then the long books -4.0 and the short books +4.0
+        assertEquals(-4.0, longPnl, 1e-9)
+        assertEquals(4.0, shortPnl, 1e-9)
     }
 
     @Test
-    fun `pnl to r uses the configured per-campaign risk budget as 1R`() {
-        // Equity 10_000 at 0.5% risk/campaign => 1R = $50; a -100 USD day is -2.0R.
-        assertEquals(-2.0, PaperPnl.pnlToR(-100.0, 10_000.0, 0.5), 1e-9)
-        // Degenerate settings (zero equity) never divide by zero.
-        assertEquals(0.0, PaperPnl.pnlToR(-100.0, 0.0, 0.5), 1e-9)
+    fun `should convert pnl to R using the configured per-campaign risk budget`() {
+        // given equity 10_000 with 0.5% risk per campaign (1R = $50) and a -$100 day
+        val equity = 10_000.0
+        val riskPct = 0.5
+        val dayPnl = -100.0
+
+        // when the day is expressed in R
+        val rMultiple = PaperPnl.pnlToR(dayPnl, equity, riskPct)
+
+        // then it is -2.0R
+        assertEquals(-2.0, rMultiple, 1e-9)
+
+        // and degenerate settings never divide by zero
+        assertEquals(0.0, PaperPnl.pnlToR(dayPnl, 0.0, riskPct), 1e-9)
     }
 
     @Test
-    fun `exposure aggregates across boards and sides`() {
+    fun `should aggregate exposure across boards and sides`() {
+        // given one long board and one short board holding $600 each
         val campaigns = listOf(
             campaign(isLong = true, filled = listOf(Triple(150.0, 4.0, 600.0))),
             campaign(isLong = false, filled = listOf(Triple(5.0, 120.0, 600.0)))
         )
-        assertEquals(1200.0, PaperPnl.openExposureUsd(campaigns), 1e-9)
+
+        // when exposure is summed
+        val exposure = PaperPnl.openExposureUsd(campaigns)
+
+        // then both sides contribute
+        assertEquals(1200.0, exposure, 1e-9)
     }
 }

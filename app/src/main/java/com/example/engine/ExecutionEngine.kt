@@ -167,7 +167,14 @@ class ExecutionEngine(private val riskEngine: RiskEngine) {
             } else slice
         }
         if (!changed) return campaign
-        return campaign.copy(entryLadder = ladder)
+        // §19: once the venue has cancelled every slice and nothing filled, the board is
+        // terminal. Leaving it STAGED made a dead board look like live resting orders to
+        // the §3 orphan intercept (and to the operator).
+        val noWorkingSlices = ladder.none { it.isResting } && ladder.none { it.isFilled }
+        return campaign.copy(
+            entryLadder = ladder,
+            status = if (noWorkingSlices) CampaignState.CANCELLED else campaign.status
+        )
     }
 
     private fun sliceIndexFrom(clientOrderId: String, campaignId: String): Int? {

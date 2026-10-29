@@ -4,6 +4,7 @@ import com.example.data.local.CandleDao
 import com.example.data.local.CandleEntity
 import com.example.data.model.CoinCalibration
 import com.example.data.model.CryptoAsset
+import com.example.data.model.LiquidationContext
 import com.example.data.model.MarketRegime
 import com.example.data.remote.BinanceFuturesClient
 import com.example.data.remote.CoinGlassClient
@@ -46,6 +47,12 @@ class UniverseScreener(private val candleDao: CandleDao) {
         const val MAX_QUOTE_VOLUME_USD = 750_000_000.0
         const val MAX_SPREAD_PCT = 0.10
         const val DEPTH_SAMPLE_LIMIT = 10
+
+        /** §4 candle horizons: 1m execution tape through 1d strategic context. */
+        val REQUIRED_TIMEFRAMES = listOf("1m", "5m", "15m", "1h", "4h", "1d")
+
+        /** Candles requested per horizon for structure, ATR and calibration. */
+        const val TIMEFRAME_LIMIT = 120
 
         // §5 Heavy Data staleness window for HTF context.
         const val HTF_STALENESS_MS: Long = 4L * 60L * 60L * 1000L
@@ -151,23 +158,24 @@ class UniverseScreener(private val candleDao: CandleDao) {
                         val lastPrice = candidate.ticker.lastPrice ?: candidate.premium?.markPrice ?: 0.0
                         val fundingRate = candidate.premium?.lastFundingRate ?: 0.0
 
-                        // §9/§15: structural + momentum multi-horizon bias from real candles.
-                        val strategicBias = IndicatorMath.structuralBias(loadCandles(candidate.symbol, "4h", 60))
+                        // §9/§15: strategic bias blends 4H structure with 1D context.
+                        val strategicBias = IndicatorMath.strategicBias(
+                            candles4h = loadCandles(candidate.symbol, "4h", 60),
+                            candles1d = loadCandles(candidate.symbol, "1d", 60)
+                        )
                         val tacticalBias = IndicatorMath.structuralBias(loadCandles(candidate.symbol, "1h", 60))
 
                         val regime = classifyRegime(strategicBias, tacticalBias)
                         val pain = IndicatorMath.painScore(fundingRate, tacticalBias)
-                        val mid = lastPrice
                         val premium = candidate.premium
-                        val index = premium?.indexPrice ?: mid
-                        val mark = premium?.markPrice ?: mid
-                        val basisFromBinance = if (index > 0.0 && mark > 0.0) {
-                            (mark - index) / index * 100.0 * 365.0
-                        } else 0.0
-                        val basisPremiumPct = when {
-                            basis.containsKey(candidate.symbol) -> basis[candidate.symbol]
-                            else -> basisFromBinance
-                        }
+                        // §4: CoinGlass basis when available, else Binance's own premium
+                        // index (mark/index − 1). Only 0.0 when no price source exists —
+                        // never as a silent substitute for a real premium reading.
+                        val basisPremiumPct = basisPremiumPctFrom(
+                            coinglassBasis = basis[candidate.symbol],
+                            indexPrice = premium?.indexPrice,
+                            markPrice = premium?.markPrice
+                        ) ?: 0.0
                         val liq = liq[candidate.symbol] ?: Pair(0.0, 0.0)
 
                         CryptoAsset(
@@ -194,7 +202,7 @@ class UniverseScreener(private val candleDao: CandleDao) {
                                 liq.first,
                                 liq.second
                             ),
-                            liquidationContext = liquidationContextFor(candidate.symbol, liq)
+                            liquidationContext = liquidationContextFor(liq)
                         )
                     }
                 }
@@ -208,22 +216,57 @@ class UniverseScreener(private val candleDao: CandleDao) {
         }
     }
 
-    /** The three decision timeframes (§7) used by structure detection and calibration. */
+    /**
+     * The full §4 candle horizon set: execution tape (1m/5m), tactical (15m/1h),
+     * structural (4h) and strategic (1d). The three decision horizons used by the
+     * structure engine stay first so existing call sites are unchanged.
+     */
     data class TimeframeCandles(
         val candles4h: List<BinanceFuturesClient.Candle>,
         val candles1h: List<BinanceFuturesClient.Candle>,
-        val candles5m: List<BinanceFuturesClient.Candle>
+        val candles5m: List<BinanceFuturesClient.Candle>,
+        val candles1d: List<BinanceFuturesClient.Candle> = emptyList(),
+        val candles15m: List<BinanceFuturesClient.Candle> = emptyList(),
+        val candles1m: List<BinanceFuturesClient.Candle> = emptyList()
     )
 
     /**
      * Loads the HTF/MTF/LTF candle set for one symbol through the §5 Room-first cache.
      * Used by the structure engine and calibration so analytics share one data path.
      */
-    suspend fun loadTimeframes(symbol: String): TimeframeCandles = TimeframeCandles(
-        candles4h = loadCandles(symbol, "4h", 120),
-        candles1h = loadCandles(symbol, "1h", 120),
-        candles5m = loadCandles(symbol, "5m", 120)
-    )
+    suspend fun loadTimeframes(
+        symbol: String,
+        loader: suspend (symbol: String, interval: String, limit: Int) -> List<BinanceFuturesClient.Candle> =
+            { s, interval, limit -> loadCandles(s, interval, limit) }
+    ): TimeframeCandles {
+        val loaded = REQUIRED_TIMEFRAMES.associateWith { interval ->
+            loader(symbol, interval, TIMEFRAME_LIMIT)
+        }
+        return TimeframeCandles(
+            candles4h = loaded.getValue("4h"),
+            candles1h = loaded.getValue("1h"),
+            candles5m = loaded.getValue("5m"),
+            candles1d = loaded.getValue("1d"),
+            candles15m = loaded.getValue("15m"),
+            candles1m = loaded.getValue("1m")
+        )
+    }
+
+    /**
+     * §4 basis derivation: prefer CoinGlass's annualized basis, else derive it from the
+     * Binance premium index (mark/index − 1, annualized). Returns null when neither
+     * source carries usable prices, so callers never present a fabricated flat basis.
+     */
+    fun basisPremiumPctFrom(
+        coinglassBasis: Double?,
+        indexPrice: Double?,
+        markPrice: Double?
+    ): Double? {
+        coinglassBasis?.let { return it }
+        if (indexPrice == null || markPrice == null) return null
+        if (indexPrice <= 0.0 || markPrice <= 0.0) return null
+        return (markPrice - indexPrice) / indexPrice * 100.0 * 365.0
+    }
 
     /**
      * §10 Coin-Specific Calibration computed from real 1h (behavior) and 5m (execution)
@@ -323,10 +366,11 @@ class UniverseScreener(private val candleDao: CandleDao) {
             tactical <= -20 && strategic >= 20 -> "Tactical bear into strategic demand"
             else -> "Range rotation"
         }
-        return "$dir (pain $pain)"
+        val flushSuffix = if (heaviestSide == "no flush") "" else " · $heaviestSide"
+        return "$dir (pain $pain)$flushSuffix"
     }
 
-    private fun liquidationContextFor(symbol: String, liq: Pair<Double, Double>): LiquidationContext {
+    private fun liquidationContextFor(liq: Pair<Double, Double>): LiquidationContext {
         return if (liq.first > 0.0 || liq.second > 0.0) {
             LiquidationContext(
                 longLiquidatedUsd24h = liq.first,

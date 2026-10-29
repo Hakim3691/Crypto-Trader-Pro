@@ -106,6 +106,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /** Paper-wallet config persistence (non-sensitive numbers only; Spec §5). */
     private val paperPrefs = application.getSharedPreferences("paper_wallet_prefs", Context.MODE_PRIVATE)
 
+    /** §36 execution-mode persistence (mode name only; credentials are never stored). */
+    private val modePrefs = application.getSharedPreferences(
+        ExecutionModeStore.PREFS_NAME,
+        Context.MODE_PRIVATE
+    )
+
     private val marketDataRepo = MarketDataRepository()
     private val universeScreener = UniverseScreener(db.candleDao())
     private val liveProvider = LiveMarketDataProvider(universeScreener)
@@ -147,11 +153,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             CoinGlassClient.apiKey = BuildConfig.COINGLASS_API_KEY
         }
         applyStoredPaperWallet()
+        applyStoredExecutionMode()
         loadInitialData()
         observeAuditLogs()
         runPreFlightDiagnostics()
         startDormantUniversePolling()
         startDiagnosticsPolling()
+    }
+
+    /**
+     * §36: restores the operator's last execution mode across restarts. A stored live
+     * mode downgrades to PAPER unless a session is already unlocked, so a cold start can
+     * never silently re-arm live routing.
+     */
+    private fun applyStoredExecutionMode() {
+        val restored = ExecutionModeStore.load(modePrefs, sessionManager.hasValidActiveSession())
+        _uiState.value = _uiState.value.copy(executionMode = restored)
     }
 
     private fun loadInitialData() {
@@ -407,6 +424,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         _uiState.value = _uiState.value.copy(executionMode = mode)
+        ExecutionModeStore.save(modePrefs, mode)
         if (isLiveMode) startLiveWalletPolling()
         viewModelScope.launch {
             repository.logAction(
@@ -713,7 +731,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     runCatching { universeScreener.loadTimeframes(it.symbol).candles1h }.getOrDefault(emptyList())
                 }.orEmpty()
                 val hadHistory = asset != null && candles.size >= MIN_SCENARIO_CANDLES
-                val metrics = if (hadHistory && asset != null) {
+                val metrics = if (hadHistory) {
                     val calibration = runCatching { universeScreener.loadCalibration(asset) }.getOrNull()
                     replayEngine.replay(
                         asset = asset,

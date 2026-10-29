@@ -81,26 +81,6 @@ class LiveMarketDataProvider(private val screener: UniverseScreener) {
         }
     }
 
-    override fun buildEvidenceFrame(asset: CryptoAsset): EvidenceFrame {
-        val normalizedTick = lastNormalizedTick
-        val regimeDrift = when (asset.regime) {
-            MarketRegime.BULLISH_CONTINUATION -> 0.12
-            MarketRegime.BEARISH_CONTINUATION -> -0.12
-            else -> 0.0
-        }
-        return FeatureEngine().buildEvidenceFrame(
-            asset = asset,
-            normalizedTick = when (normalizedTick) {
-                NormalizedTick.LOW_VOL, NormalizedTick.NO_DATA, NormalizedTick.SAY_PRICE, NormalizedTick.HIGH_VOL,
-                null -> NormalizedTick.NO_DATA
-                else -> normalizedTick
-            },
-            currentRegime = asset.regime,
-            oiFromCorpus = lastCorpusOtsBySymbol[asset.symbol],
-            regimeDrift = regimeDrift
-        )
-    }
-
     /**
      * §5 Active Delta Mode: price/OI/funding deltas for the selected symbol only.
      * Price ticks come from the real bookTicker WS; OI/funding are re-quoted over REST
@@ -199,6 +179,7 @@ class LiveMarketDataProvider(private val screener: UniverseScreener) {
             acceptanceQuality = if (asset.tacticalBias > 0) 0.72 else 0.38,
             rejectionQuality = if (asset.tacticalBias < 0) 0.68 else 0.41,
             trapProbabilityPct = trapProb,
+            liquidationContext = asset.liquidationContext,
             recentImpulseQuality = when {
                 takerRatio > 0.6 -> "Taker Buy Dominance (Live)"
                 takerRatio < 0.4 -> "Taker Sell Pressure (Live)"

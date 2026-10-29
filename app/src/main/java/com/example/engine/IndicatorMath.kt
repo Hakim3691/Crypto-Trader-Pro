@@ -107,6 +107,21 @@ object IndicatorMath {
         }
     }
 
+    /**
+     * §9/§15 strategic bias: 4H structure weighted twice against 1D context, so the
+     * higher timeframe sets direction while the intermediate one times it. Degrades to
+     * the 4H reading alone when daily history is unavailable.
+     */
+    fun strategicBias(
+        candles4h: List<BinanceFuturesClient.Candle>,
+        candles1d: List<BinanceFuturesClient.Candle>
+    ): Int {
+        val htf = structuralBias(candles4h)
+        if (candles1d.isEmpty()) return htf
+        val daily = structuralBias(candles1d)
+        return ((htf * 2 + daily) / 3).coerceIn(-100, 100)
+    }
+
     /** Legacy momentum-only bias (kept for the screener's fast path and tests). */
     fun interimBias(candles: List<BinanceFuturesClient.Candle>, lookback: Int = 20): Int {
         if (candles.isEmpty()) return 0

@@ -4,7 +4,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.History
-import androidx.compose.material.icons.filled.ListAlt
+import androidx.compose.material.icons.automirrored.filled.ListAlt
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material3.Icon
@@ -24,7 +24,7 @@ import com.example.ui.theme.SlateTextMuted
 import com.example.ui.theme.SlateTextPrimary
 
 enum class AppDestination(val route: String, val title: String, val icon: ImageVector) {
-    SCREENER("screener", "Screener", Icons.Default.ListAlt),
+    SCREENER("screener", "Screener", Icons.AutoMirrored.Filled.ListAlt),
     DASHBOARD("dashboard", "Dashboard", Icons.Default.Dashboard),
     TELEMETRY("telemetry", "Telemetry", Icons.Default.Sensors),
     RISK("risk", "Guardrails", Icons.Default.Security),
